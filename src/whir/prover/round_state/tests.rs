@@ -164,7 +164,9 @@ mod field {
         let statement = EqStatement::<EF4>::initialize(num_variables);
 
         // Initialize the round state using the setup configuration and witness
+        let dft = Radix2DFTSmallBatch::<F>::default();
         let state = RoundState::initialize_first_round_state(
+            &dft,
             &Prover(&config),
             &mut proof,
             &mut challenger,
@@ -242,7 +244,9 @@ mod field {
         let (mut proof, mut challenger_rf, witness) = setup_domain_and_commitment(&config, poly);
 
         // Run the first round state initialization (this will trigger sumcheck)
+        let dft = Radix2DFTSmallBatch::<F>::default();
         let state = RoundState::initialize_first_round_state(
+            &dft,
             &Prover(&config),
             &mut proof,
             &mut challenger_rf,
@@ -316,7 +320,9 @@ mod field {
         }
 
         // Initialize the first round of the WHIR protocol with the zero polynomial and constraints
+        let dft = Radix2DFTSmallBatch::<F>::default();
         let state = RoundState::initialize_first_round_state(
+            &dft,
             &Prover(&config),
             &mut proof,
             &mut challenger_rf,
@@ -416,7 +422,9 @@ mod field {
         let (mut proof, mut challenger_rf, witness) = setup_domain_and_commitment(&config, poly);
 
         // Run the first round initialization
+        let dft = Radix2DFTSmallBatch::<F>::default();
         let state = RoundState::initialize_first_round_state(
+            &dft,
             &Prover(&config),
             &mut proof,
             &mut challenger_rf,
@@ -553,7 +561,9 @@ mod keccak {
         let (mut proof, mut challenger, witness) = setup_domain_and_commitment(&config, poly);
         let statement = EqStatement::<EF4>::initialize(num_variables);
 
+        let dft = Radix2DFTSmallBatch::<F>::default();
         let state = RoundState::initialize_first_round_state(
+            &dft,
             &Prover(&config),
             &mut proof,
             &mut challenger,
@@ -614,7 +624,9 @@ mod keccak {
         );
 
         let (mut proof, mut challenger, witness) = setup_domain_and_commitment(&config, poly);
+        let dft = Radix2DFTSmallBatch::<F>::default();
         let state = RoundState::initialize_first_round_state(
+            &dft,
             &Prover(&config),
             &mut proof,
             &mut challenger,
@@ -653,7 +665,9 @@ mod keccak {
             statement.add_evaluated_constraint(MultilinearPoint::new(point), EF4::ZERO);
         }
 
+        let dft = Radix2DFTSmallBatch::<F>::default();
         let state = RoundState::initialize_first_round_state(
+            &dft,
             &Prover(&config),
             &mut proof,
             &mut challenger,
@@ -721,7 +735,9 @@ mod keccak {
         );
 
         let (mut proof, mut challenger, witness) = setup_domain_and_commitment(&config, poly);
+        let dft = Radix2DFTSmallBatch::<F>::default();
         let state = RoundState::initialize_first_round_state(
+            &dft,
             &Prover(&config),
             &mut proof,
             &mut challenger,
