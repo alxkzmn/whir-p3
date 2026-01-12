@@ -56,6 +56,7 @@ p3-maybe-rayon = { git = "https://github.com/Plonky3/Plonky3.git", rev = "a9d5bb
 ] }
 p3-interpolation = { git = "https://github.com/Plonky3/Plonky3.git", rev = "a9d5bbb" }
 p3-challenger = { git = "https://github.com/Plonky3/Plonky3.git", rev = "a9d5bbb" }
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3.git", rev = "a9d5bbb", optional = true }
 p3-multilinear-util = { git = "https://github.com/Plonky3/Plonky3.git", rev = "a9d5bbb" }
 
 hashbrown = "0.16"
@@ -87,7 +88,7 @@ default = ["parallel"]
 parallel = ["dep:rayon", "p3-maybe-rayon/parallel", "p3-util/parallel"]
 rayon = ["dep:rayon"]
 cli = ["dep:clap", "dep:tracing-subscriber", "dep:tracing-forest", "dep:bincode", "rand/default"]
-keccak = []
+keccak = ["dep:p3-keccak"]
 
 [[bin]]
 name = "main"

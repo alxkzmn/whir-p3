@@ -1,4 +1,4 @@
-use alloc::{vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 use core::ops::{Add, AddAssign, Mul, MulAssign};
 
 use hashbrown::HashSet;

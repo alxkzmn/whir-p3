@@ -1,4 +1,4 @@
-use alloc::{vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 
 use p3_field::{ExtensionField, Field, TwoAdicField};
 
