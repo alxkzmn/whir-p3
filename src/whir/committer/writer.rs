@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::ops::Deref;
 
-use p3_challenger::{FieldChallenger, GrindingChallenger};
+use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
 use p3_commit::Mmcs;
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, Field, TwoAdicField};
@@ -17,6 +17,7 @@ use crate::{
     poly::{evals::EvaluationsList, multilinear::MultilinearPoint},
     whir::{
         committer::DenseMatrix, constraints::statement::EqStatement, parameters::WhirConfig,
+        digest::{DigestWord, LeafPacking, ObserveMerkleRoot},
         proof::WhirProof,
     },
 };
@@ -57,21 +58,24 @@ where
     /// - Computes out-of-domain (OOD) challenge points and their evaluations.
     /// - Returns a `Witness` containing the commitment data.
     #[instrument(skip_all)]
-    pub fn commit<Dft: TwoAdicSubgroupDft<F>, const DIGEST_ELEMS: usize>(
+    pub fn commit<Dft: TwoAdicSubgroupDft<F>, const DIGEST_ELEMS: usize, W>(
         &self,
         dft: &Dft,
-        proof: &mut WhirProof<F, EF, DIGEST_ELEMS>,
+        proof: &mut WhirProof<F, EF, DIGEST_ELEMS, W>,
         challenger: &mut Challenger,
         polynomial: EvaluationsList<F>,
-    ) -> Result<Witness<EF, F, DenseMatrix<F>, DIGEST_ELEMS>, FiatShamirError>
+    ) -> Result<Witness<EF, F, DenseMatrix<F>, DIGEST_ELEMS, W>, FiatShamirError>
     where
-        H: CryptographicHasher<F, [F; DIGEST_ELEMS]>
-            + CryptographicHasher<F::Packing, [F::Packing; DIGEST_ELEMS]>
+        W: LeafPacking<F> + Serialize + for<'de> Deserialize<'de>,
+        (): ObserveMerkleRoot<F, W, DIGEST_ELEMS>,
+        Challenger: CanObserve<<() as ObserveMerkleRoot<F, W, DIGEST_ELEMS>>::Obs>,
+        H: CryptographicHasher<F, [W; DIGEST_ELEMS]>
+            + CryptographicHasher<<W as LeafPacking<F>>::LeafPacked, [<W as DigestWord<F>>::Packed; DIGEST_ELEMS]>
             + Sync,
-        C: PseudoCompressionFunction<[F; DIGEST_ELEMS], 2>
-            + PseudoCompressionFunction<[F::Packing; DIGEST_ELEMS], 2>
+        C: PseudoCompressionFunction<[W; DIGEST_ELEMS], 2>
+            + PseudoCompressionFunction<[<W as DigestWord<F>>::Packed; DIGEST_ELEMS], 2>
             + Sync,
-        [F; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+        [W; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
     {
         // Transpose for reverse variable order
         // And then pad with zeros
@@ -95,7 +99,13 @@ where
             .in_scope(|| dft.dft_batch(padded).to_row_major_matrix());
 
         // Commit to the Merkle tree
-        let merkle_tree = MerkleTreeMmcs::<F::Packing, F::Packing, H, C, DIGEST_ELEMS>::new(
+        let merkle_tree = MerkleTreeMmcs::<
+            <W as LeafPacking<F>>::LeafPacked,
+            <W as DigestWord<F>>::Packed,
+            H,
+            C,
+            DIGEST_ELEMS,
+        >::new(
             self.merkle_hash.clone(),
             self.merkle_compress.clone(),
         );
@@ -103,7 +113,7 @@ where
             info_span!("commit_matrix").in_scope(|| merkle_tree.commit_matrix(folded_matrix));
 
         proof.initial_commitment = *root.as_ref();
-        challenger.observe_slice(root.as_ref());
+        <() as ObserveMerkleRoot<F, W, DIGEST_ELEMS>>::observe_root(challenger, root);
 
         let mut ood_statement = EqStatement::initialize(self.num_variables);
         (0..self.0.commitment_ood_samples).for_each(|_| {

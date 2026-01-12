@@ -21,6 +21,7 @@ use crate::{
 
 pub mod committer;
 pub mod constraints;
+pub mod digest;
 pub mod parameters;
 pub mod proof;
 pub mod prover;
@@ -34,6 +35,11 @@ type Perm = Poseidon2BabyBear<16>;
 type MyHash = PaddingFreeSponge<Perm, 16, 8, 8>;
 type MyCompress = TruncatedPermutation<Perm, 2, 8, 16>;
 type MyChallenger = DuplexChallenger<F, Perm, 16, 8>;
+
+/// Number of **field elements** in the Merkle digest for the Poseidon-based configuration.
+///
+/// This must match the output shape of `MyHash`/`MyCompress` (i.e. `[F; DIGEST_ELEMS]`).
+const POSEIDON_DIGEST_ELEMS: usize = 8;
 
 /// Run a complete WHIR proof lifecycle with configurable parameters.
 #[allow(clippy::too_many_arguments)]
@@ -102,9 +108,9 @@ pub fn make_whir_things(
     // Setup Fiat-Shamir transcript structure for non-interactive proof generation
     let mut domainsep = DomainSeparator::new(vec![]);
     // Add statement commitment to transcript
-    domainsep.commit_statement::<_, _, _, 32>(&params);
+    domainsep.commit_statement::<_, _, _, POSEIDON_DIGEST_ELEMS>(&params);
     // Add proof structure to transcript
-    domainsep.add_whir_proof::<_, _, _, 32>(&params);
+    domainsep.add_whir_proof::<_, _, _, POSEIDON_DIGEST_ELEMS>(&params);
 
     // Create fresh RNG and challenger for transcript randomness
     // Initialize prover's view of the Fiat-Shamir transcript
@@ -117,7 +123,10 @@ pub fn make_whir_things(
     // DFT evaluator for polynomial
     let dft = Radix2DFTSmallBatch::<F>::default();
 
-    let mut proof = WhirProof::<F, EF, 8>::from_protocol_parameters(&whir_params, num_variables);
+    let mut proof = WhirProof::<F, EF, POSEIDON_DIGEST_ELEMS>::from_protocol_parameters(
+        &whir_params,
+        num_variables,
+    );
 
     // Commit to polynomial evaluations and generate cryptographic witness
     let witness = committer
@@ -153,8 +162,7 @@ pub fn make_whir_things(
     domainsep.observe_domain_separator(&mut verifier_challenger);
 
     // Parse and validate the polynomial commitment from proof data
-    let parsed_commitment =
-        commitment_reader.parse_commitment::<8>(&proof, &mut verifier_challenger);
+    let parsed_commitment = commitment_reader.parse_commitment(&proof, &mut verifier_challenger);
 
     // Execute WHIR verification
     verifier

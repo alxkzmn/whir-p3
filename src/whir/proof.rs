@@ -13,12 +13,12 @@ use crate::{
 /// Complete WHIR proof
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(bound(
-    serialize = "F: Serialize, EF: Serialize, [F; DIGEST_ELEMS]: Serialize",
-    deserialize = "F: Deserialize<'de>, EF: Deserialize<'de>, [F; DIGEST_ELEMS]: Deserialize<'de>"
+    serialize = "F: Serialize, EF: Serialize, [W; DIGEST_ELEMS]: Serialize",
+    deserialize = "F: Deserialize<'de>, EF: Deserialize<'de>, [W; DIGEST_ELEMS]: Deserialize<'de>"
 ))]
-pub struct WhirProof<F, EF, const DIGEST_ELEMS: usize> {
+pub struct WhirProof<F, EF, const DIGEST_ELEMS: usize, W = F> {
     /// Initial polynomial commitment (Merkle root)
-    pub initial_commitment: [F; DIGEST_ELEMS],
+    pub initial_commitment: [W; DIGEST_ELEMS],
 
     /// Initial OOD evaluations
     pub initial_ood_answers: Vec<EF>,
@@ -27,7 +27,7 @@ pub struct WhirProof<F, EF, const DIGEST_ELEMS: usize> {
     pub initial_phase: InitialPhase<EF, F>,
 
     /// One proof per WHIR round
-    pub rounds: Vec<WhirRoundProof<F, EF, DIGEST_ELEMS>>,
+    pub rounds: Vec<WhirRoundProof<F, EF, DIGEST_ELEMS, W>>,
 
     /// Final polynomial evaluations
     pub final_poly: Option<EvaluationsList<EF>>,
@@ -36,18 +36,22 @@ pub struct WhirProof<F, EF, const DIGEST_ELEMS: usize> {
     pub final_pow_witness: F,
 
     /// Final round query openings
-    pub final_queries: Vec<QueryOpening<F, EF, DIGEST_ELEMS>>,
+    pub final_queries: Vec<QueryOpening<F, EF, DIGEST_ELEMS, W>>,
 
     /// Final sumcheck (if final_sumcheck_rounds > 0)
     pub final_sumcheck: Option<SumcheckData<EF, F>>,
 }
 
-impl<F: Default, EF: Default, const DIGEST_ELEMS: usize> Default
-    for WhirProof<F, EF, DIGEST_ELEMS>
+/// Keccak-friendly WHIR proof type: bytes32 Merkle root and auth path nodes.
+#[cfg(feature = "keccak")]
+pub type WhirProofKeccak<F, EF> = WhirProof<F, EF, 32, u8>;
+
+impl<F: Default, EF: Default, W: Default, const DIGEST_ELEMS: usize> Default
+    for WhirProof<F, EF, DIGEST_ELEMS, W>
 {
     fn default() -> Self {
         Self {
-            initial_commitment: array::from_fn(|_| F::default()),
+            initial_commitment: array::from_fn(|_| W::default()),
             initial_ood_answers: Vec::new(),
             initial_phase: InitialPhase::default(),
             rounds: Vec::new(),
@@ -99,12 +103,12 @@ impl<F: Default, EF: Default> Default for InitialPhase<EF, F> {
 /// Data for a single WHIR round
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(bound(
-    serialize = "F: Serialize, EF: Serialize, [F; DIGEST_ELEMS]: Serialize",
-    deserialize = "F: Deserialize<'de>, EF: Deserialize<'de>, [F; DIGEST_ELEMS]: Deserialize<'de>"
+    serialize = "F: Serialize, EF: Serialize, [W; DIGEST_ELEMS]: Serialize",
+    deserialize = "F: Deserialize<'de>, EF: Deserialize<'de>, [W; DIGEST_ELEMS]: Deserialize<'de>"
 ))]
-pub struct WhirRoundProof<F, EF, const DIGEST_ELEMS: usize> {
+pub struct WhirRoundProof<F, EF, const DIGEST_ELEMS: usize, W = F> {
     /// Round commitment (Merkle root)
-    pub commitment: [F; DIGEST_ELEMS],
+    pub commitment: [W; DIGEST_ELEMS],
 
     /// OOD evaluations for this round
     pub ood_answers: Vec<EF>,
@@ -113,18 +117,18 @@ pub struct WhirRoundProof<F, EF, const DIGEST_ELEMS: usize> {
     pub pow_witness: F,
 
     /// STIR query openings
-    pub queries: Vec<QueryOpening<F, EF, DIGEST_ELEMS>>,
+    pub queries: Vec<QueryOpening<F, EF, DIGEST_ELEMS, W>>,
 
     /// Sumcheck data for this round
     pub sumcheck: SumcheckData<EF, F>,
 }
 
-impl<F: Default, EF: Default, const DIGEST_ELEMS: usize> Default
-    for WhirRoundProof<F, EF, DIGEST_ELEMS>
+impl<F: Default, EF: Default, W: Default, const DIGEST_ELEMS: usize> Default
+    for WhirRoundProof<F, EF, DIGEST_ELEMS, W>
 {
     fn default() -> Self {
         Self {
-            commitment: array::from_fn(|_| F::default()),
+            commitment: array::from_fn(|_| W::default()),
             ood_answers: Vec::new(),
             pow_witness: F::default(),
             queries: Vec::new(),
@@ -137,19 +141,19 @@ impl<F: Default, EF: Default, const DIGEST_ELEMS: usize> Default
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(
     bound(
-        serialize = "F: Serialize, EF: Serialize, [F; DIGEST_ELEMS]: Serialize",
-        deserialize = "F: Deserialize<'de>, EF: Deserialize<'de>, [F; DIGEST_ELEMS]: Deserialize<'de>"
+        serialize = "F: Serialize, EF: Serialize, [W; DIGEST_ELEMS]: Serialize",
+        deserialize = "F: Deserialize<'de>, EF: Deserialize<'de>, [W; DIGEST_ELEMS]: Deserialize<'de>"
     ),
     tag = "type"
 )]
-pub enum QueryOpening<F, EF, const DIGEST_ELEMS: usize> {
+pub enum QueryOpening<F, EF, const DIGEST_ELEMS: usize, W = F> {
     /// Base field query (round_index == 0)
     #[serde(rename = "base")]
     Base {
         /// Merkle leaf values in F
         values: Vec<F>,
         /// Merkle authentication path
-        proof: Vec<[F; DIGEST_ELEMS]>,
+        proof: Vec<[W; DIGEST_ELEMS]>,
     },
     /// Extension field query (round_index > 0)
     #[serde(rename = "extension")]
@@ -157,8 +161,38 @@ pub enum QueryOpening<F, EF, const DIGEST_ELEMS: usize> {
         /// Merkle leaf values in EF
         values: Vec<EF>,
         /// Merkle authentication path
-        proof: Vec<[F; DIGEST_ELEMS]>,
+        proof: Vec<[W; DIGEST_ELEMS]>,
     },
+}
+
+impl<F, EF, const DIGEST_ELEMS: usize, W> QueryOpening<F, EF, DIGEST_ELEMS, W> {
+    /// Returns `true` if this opening is over the base field.
+    pub fn is_base(&self) -> bool {
+        matches!(self, Self::Base { .. })
+    }
+
+    /// Returns the opened base field values, if this is a base opening.
+    pub fn base_values(&self) -> Option<&[F]> {
+        match self {
+            Self::Base { values, .. } => Some(values),
+            Self::Extension { .. } => None,
+        }
+    }
+
+    /// Returns the opened extension field values, if this is an extension opening.
+    pub fn extension_values(&self) -> Option<&[EF]> {
+        match self {
+            Self::Extension { values, .. } => Some(values),
+            Self::Base { .. } => None,
+        }
+    }
+
+    /// Returns the Merkle authentication path nodes for this opening.
+    pub fn merkle_proof(&self) -> &[[W; DIGEST_ELEMS]] {
+        match self {
+            Self::Base { proof, .. } | Self::Extension { proof, .. } => proof,
+        }
+    }
 }
 
 /// Sumcheck polynomial data
@@ -241,7 +275,9 @@ pub struct SumcheckSkipData<EF, F> {
     pub sumcheck: SumcheckData<EF, F>,
 }
 
-impl<F: Default, EF: Default, const DIGEST_ELEMS: usize> WhirProof<F, EF, DIGEST_ELEMS> {
+impl<F: Default, EF: Default, W: Default, const DIGEST_ELEMS: usize>
+    WhirProof<F, EF, DIGEST_ELEMS, W>
+{
     /// Create a new WhirProof from protocol parameters and configuration
     ///
     /// This initializes an empty proof structure with appropriate capacity allocations
@@ -295,7 +331,7 @@ impl<F: Default, EF: Default, const DIGEST_ELEMS: usize> WhirProof<F, EF, DIGEST
             .queries(protocol_security_level, params.starting_log_inv_rate);
 
         Self {
-            initial_commitment: array::from_fn(|_| F::default()),
+            initial_commitment: array::from_fn(|_| W::default()),
             initial_ood_answers: Vec::new(),
             initial_phase,
             rounds: (0..num_rounds).map(|_| WhirRoundProof::default()).collect(),
@@ -307,7 +343,7 @@ impl<F: Default, EF: Default, const DIGEST_ELEMS: usize> WhirProof<F, EF, DIGEST
     }
 }
 
-impl<F: Clone, EF, const DIGEST_ELEMS: usize> WhirProof<F, EF, DIGEST_ELEMS> {
+impl<F: Clone, EF, W, const DIGEST_ELEMS: usize> WhirProof<F, EF, DIGEST_ELEMS, W> {
     /// Extract the PoW witness after the commitment at the given round index
     ///
     /// Returns the PoW witness from the round at the given index.
@@ -697,7 +733,7 @@ mod tests {
         // Create a default WhirRoundProof
         let round: WhirRoundProof<F, EF, DIGEST_ELEMS> = WhirRoundProof::default();
 
-        // Verify commitment is array of default F values
+        // Verify commitment is an array of default digest words
         assert_eq!(round.commitment.len(), DIGEST_ELEMS);
         for elem in round.commitment {
             assert_eq!(elem, F::default());

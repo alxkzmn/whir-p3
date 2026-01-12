@@ -42,6 +42,9 @@ type MerkleHash = PaddingFreeSponge<Poseidon24, 24, 16, 8>; // leaf hashing
 type MerkleCompress = TruncatedPermutation<Poseidon16, 2, 8, 16>; // 2-to-1 compression
 type MyChallenger = DuplexChallenger<F, Poseidon16, 16, 8>;
 
+/// Number of field elements in the Merkle digest for the Poseidon-based configuration.
+const POSEIDON_DIGEST_ELEMS: usize = 8;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -148,8 +151,8 @@ fn main() {
 
     // Define the Fiat-Shamir domain separator pattern for committing and proving
     let mut domainsep = DomainSeparator::new(vec![]);
-    domainsep.commit_statement::<_, _, _, 32>(&params);
-    domainsep.add_whir_proof::<_, _, _, 32>(&params);
+    domainsep.commit_statement::<_, _, _, POSEIDON_DIGEST_ELEMS>(&params);
+    domainsep.add_whir_proof::<_, _, _, POSEIDON_DIGEST_ELEMS>(&params);
 
     println!("=========================================");
     println!("Whir (PCS) 🌪️");
@@ -168,7 +171,10 @@ fn main() {
 
     let dft = Radix2DFTSmallBatch::<F>::new(1 << params.max_fft_size());
 
-    let mut proof = WhirProof::<F, EF, 8>::from_protocol_parameters(&whir_params, num_variables);
+    let mut proof = WhirProof::<F, EF, POSEIDON_DIGEST_ELEMS>::from_protocol_parameters(
+        &whir_params,
+        num_variables,
+    );
 
     let time = Instant::now();
     let witness = committer
@@ -204,8 +210,8 @@ fn main() {
     domainsep.observe_domain_separator(&mut verifier_challenger);
 
     // Parse the commitment
-    let parsed_commitment =
-        commitment_reader.parse_commitment::<8>(&proof, &mut verifier_challenger);
+    let parsed_commitment = commitment_reader
+        .parse_commitment::<POSEIDON_DIGEST_ELEMS, F>(&proof, &mut verifier_challenger);
 
     let verif_time = Instant::now();
     verifier

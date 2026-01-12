@@ -206,8 +206,8 @@ where
 /// # Returns
 ///
 /// - A `MultilinearPoint` of folding randomness values in reverse order.
-pub(crate) fn verify_sumcheck_rounds<F, EF, Challenger, const DIGEST_ELEMS: usize>(
-    round_proof: &WhirRoundProof<F, EF, DIGEST_ELEMS>,
+pub(crate) fn verify_sumcheck_rounds<F, EF, Challenger, const DIGEST_ELEMS: usize, W>(
+    round_proof: &WhirRoundProof<F, EF, DIGEST_ELEMS, W>,
     challenger: &mut Challenger,
     claimed_sum: &mut EF,
     rounds: usize,

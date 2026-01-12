@@ -1,12 +1,17 @@
 use core::{fmt::Debug, ops::Deref};
 
-use p3_challenger::{FieldChallenger, GrindingChallenger};
+use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
 use p3_field::{ExtensionField, Field, TwoAdicField};
 use p3_symmetric::Hash;
 
 use crate::{
     poly::multilinear::MultilinearPoint,
-    whir::{constraints::statement::EqStatement, parameters::WhirConfig, proof::WhirProof},
+    whir::{
+        constraints::statement::EqStatement,
+        digest::{DigestWord, ObserveMerkleRoot},
+        parameters::WhirConfig,
+        proof::WhirProof,
+    },
 };
 
 /// Represents a parsed commitment from the prover in the WHIR protocol.
@@ -56,31 +61,39 @@ where
     /// - The prover's claimed answers at those points.
     ///
     /// This is used to verify consistency of polynomial commitments in WHIR.
-    pub fn parse<EF, Challenger, const DIGEST_ELEMS: usize>(
-        proof: &WhirProof<F, EF, DIGEST_ELEMS>,
+    pub fn parse<EF, Challenger, const DIGEST_ELEMS: usize, W>(
+        proof: &WhirProof<F, EF, DIGEST_ELEMS, W>,
         challenger: &mut Challenger,
         num_variables: usize,
         ood_samples: usize,
-    ) -> ParsedCommitment<EF, Hash<F, F, DIGEST_ELEMS>>
+    ) -> ParsedCommitment<EF, Hash<F, W, DIGEST_ELEMS>>
     where
         F: TwoAdicField,
         EF: ExtensionField<F> + TwoAdicField,
-        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        W: DigestWord<F>,
+        (): ObserveMerkleRoot<F, W, DIGEST_ELEMS>,
+        Challenger: FieldChallenger<F>
+            + GrindingChallenger<Witness = F>
+            + CanObserve<<() as ObserveMerkleRoot<F, W, DIGEST_ELEMS>>::Obs>,
     {
         Self::parse_with_round(proof, challenger, num_variables, ood_samples, None)
     }
 
-    pub fn parse_with_round<EF, Challenger, const DIGEST_ELEMS: usize>(
-        proof: &WhirProof<F, EF, DIGEST_ELEMS>,
+    pub fn parse_with_round<EF, Challenger, const DIGEST_ELEMS: usize, W>(
+        proof: &WhirProof<F, EF, DIGEST_ELEMS, W>,
         challenger: &mut Challenger,
         num_variables: usize,
         ood_samples: usize,
         round_index: Option<usize>,
-    ) -> ParsedCommitment<EF, Hash<F, F, DIGEST_ELEMS>>
+    ) -> ParsedCommitment<EF, Hash<F, W, DIGEST_ELEMS>>
     where
         F: TwoAdicField,
         EF: ExtensionField<F> + TwoAdicField,
-        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        W: DigestWord<F>,
+        (): ObserveMerkleRoot<F, W, DIGEST_ELEMS>,
+        Challenger: FieldChallenger<F>
+            + GrindingChallenger<Witness = F>
+            + CanObserve<<() as ObserveMerkleRoot<F, W, DIGEST_ELEMS>>::Obs>,
     {
         let (root_array, ood_answers) = round_index.map_or_else(
             || (proof.initial_commitment, proof.initial_ood_answers.clone()),
@@ -91,10 +104,10 @@ where
         );
 
         // Convert to Hash type
-        let root: Hash<F, F, DIGEST_ELEMS> = root_array.into();
+        let root: Hash<F, W, DIGEST_ELEMS> = root_array.into();
 
         // Observe the root in the challenger to match prover's transcript
-        challenger.observe_slice(&root_array);
+        <() as ObserveMerkleRoot<F, W, DIGEST_ELEMS>>::observe_root(challenger, root);
 
         // Construct equality constraints for all out-of-domain (OOD) samples.
         // Each constraint enforces that the committed polynomial evaluates to the
@@ -151,12 +164,17 @@ where
     ///
     /// Reads the Merkle root and out-of-domain (OOD) challenge points and answers
     /// expected for verifying the committed polynomial.
-    pub fn parse_commitment<const DIGEST_ELEMS: usize>(
+    pub fn parse_commitment<const DIGEST_ELEMS: usize, W>(
         &self,
-        proof: &WhirProof<F, EF, DIGEST_ELEMS>,
+        proof: &WhirProof<F, EF, DIGEST_ELEMS, W>,
         challenger: &mut Challenger,
-    ) -> ParsedCommitment<EF, Hash<F, F, DIGEST_ELEMS>> {
-        ParsedCommitment::<_, Hash<F, F, DIGEST_ELEMS>>::parse(
+    ) -> ParsedCommitment<EF, Hash<F, W, DIGEST_ELEMS>>
+    where
+        W: DigestWord<F>,
+        (): ObserveMerkleRoot<F, W, DIGEST_ELEMS>,
+        Challenger: CanObserve<<() as ObserveMerkleRoot<F, W, DIGEST_ELEMS>>::Obs>,
+    {
+        ParsedCommitment::<_, Hash<F, W, DIGEST_ELEMS>>::parse(
             proof,
             challenger,
             self.num_variables,
@@ -289,7 +307,7 @@ mod tests {
 
         // Create a commitment reader and parse the commitment from verifier state.
         let reader = CommitmentReader::new(&params);
-        let parsed = reader.parse_commitment::<8>(&proof, &mut verifier_challenger);
+        let parsed = reader.parse_commitment::<8, F>(&proof, &mut verifier_challenger);
 
         // Ensure the Merkle root matches between prover and parsed result.
         assert_eq!(parsed.root, witness.prover_data.root());
@@ -331,7 +349,7 @@ mod tests {
 
         // Parse the commitment from verifier transcript.
         let reader = CommitmentReader::new(&params);
-        let parsed = reader.parse_commitment::<8>(&proof, &mut verifier_challenger);
+        let parsed = reader.parse_commitment::<8, F>(&proof, &mut verifier_challenger);
 
         // Validate the Merkle root matches.
         assert_eq!(parsed.root, witness.prover_data.root());
@@ -373,7 +391,7 @@ mod tests {
 
         // Parse the commitment from verifier's transcript.
         let reader = CommitmentReader::new(&params);
-        let parsed = reader.parse_commitment::<8>(&proof, &mut verifier_challenger);
+        let parsed = reader.parse_commitment::<8, F>(&proof, &mut verifier_challenger);
 
         // Check Merkle root and OOD answers match.
         assert_eq!(parsed.root, witness.prover_data.root());
@@ -412,7 +430,7 @@ mod tests {
 
         // Parse the commitment from the verifier's state.
         let reader = CommitmentReader::new(&params);
-        let parsed = reader.parse_commitment::<8>(&proof, &mut verifier_challenger);
+        let parsed = reader.parse_commitment::<8, F>(&proof, &mut verifier_challenger);
 
         // Each constraint should have correct univariate weight, sum, and flag.
         for (i, (point, &eval)) in parsed.ood_statement.iter().enumerate() {

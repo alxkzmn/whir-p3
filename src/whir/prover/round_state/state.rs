@@ -18,6 +18,7 @@ use crate::{
     whir::{
         committer::{RoundMerkleTree, Witness},
         constraints::{Constraint, statement::EqStatement},
+        digest::DigestWord,
         proof::{InitialPhase, SumcheckSkipData, WhirProof},
         prover::Prover,
     },
@@ -116,10 +117,11 @@ where
 }
 
 #[allow(clippy::mismatching_type_param_order)]
-impl<EF, F, const DIGEST_ELEMS: usize> RoundState<EF, F, F, DenseMatrix<F>, DIGEST_ELEMS>
+impl<EF, F, W, const DIGEST_ELEMS: usize> RoundState<EF, F, W, DenseMatrix<F>, DIGEST_ELEMS>
 where
     F: TwoAdicField + Ord,
     EF: ExtensionField<F> + TwoAdicField,
+    W: DigestWord<F>,
 {
     /// Initializes the first round state for the WHIR protocol.
     ///
@@ -137,10 +139,10 @@ where
     #[instrument(skip_all)]
     pub fn initialize_first_round_state<MyChallenger, C, Challenger>(
         prover: &Prover<'_, EF, F, MyChallenger, C, Challenger>,
-        proof: &mut WhirProof<F, EF, DIGEST_ELEMS>,
+        proof: &mut WhirProof<F, EF, DIGEST_ELEMS, W>,
         challenger: &mut Challenger,
         mut statement: EqStatement<EF>,
-        witness: Witness<EF, F, DenseMatrix<F>, DIGEST_ELEMS>,
+        witness: Witness<EF, F, DenseMatrix<F>, DIGEST_ELEMS, W>,
     ) -> Result<Self, FiatShamirError>
     where
         Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
