@@ -58,6 +58,30 @@ fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
         })
         .sum::<EF>();
 
+    // Explicit linear constraints contribute their weight-polynomial evaluations.
+    // These are weighted by the same challenge powers as equality constraints, continuing
+    // immediately after the point-evaluation constraints.
+    //
+    // NOTE: The univariate-skip path (use_skip_eval) is not compatible with generic linear
+    // functionals in the current protocol; those constraints should not be present there.
+    if use_skip_eval {
+        debug_assert!(constraint.eq_statement.linear_weights.is_empty());
+        debug_assert!(constraint.eq_statement.linear_evaluations.is_empty());
+    }
+
+    let linear_eq_contribution = if constraint.eq_statement.linear_weights.is_empty() {
+        EF::ZERO
+    } else {
+        let point_eq_count = constraint.eq_statement.points.len();
+        constraint
+            .eq_statement
+            .linear_weights
+            .iter()
+            .zip(constraint.challenge.powers().skip(point_eq_count))
+            .map(|(weights, coeff)| weights.evaluate_hypercube_ext::<F>(&eval_point) * coeff)
+            .sum::<EF>()
+    };
+
     let sel_contribution = constraint
         .iter_sels()
         .map(|(&var, coeff)| {
@@ -67,7 +91,7 @@ fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
         })
         .sum::<EF>();
 
-    eq_contribution + sel_contribution
+    eq_contribution + linear_eq_contribution + sel_contribution
 }
 
 /// Lightweight evaluator for the combined constraint polynomial W(r).

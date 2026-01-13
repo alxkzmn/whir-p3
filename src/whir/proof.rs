@@ -167,11 +167,13 @@ pub enum QueryOpening<F, EF, const DIGEST_ELEMS: usize, W = F> {
 
 impl<F, EF, const DIGEST_ELEMS: usize, W> QueryOpening<F, EF, DIGEST_ELEMS, W> {
     /// Returns `true` if this opening is over the base field.
-    pub fn is_base(&self) -> bool {
+    #[must_use]
+    pub const fn is_base(&self) -> bool {
         matches!(self, Self::Base { .. })
     }
 
     /// Returns the opened base field values, if this is a base opening.
+    #[must_use]
     pub fn base_values(&self) -> Option<&[F]> {
         match self {
             Self::Base { values, .. } => Some(values),
@@ -180,6 +182,7 @@ impl<F, EF, const DIGEST_ELEMS: usize, W> QueryOpening<F, EF, DIGEST_ELEMS, W> {
     }
 
     /// Returns the opened extension field values, if this is an extension opening.
+    #[must_use]
     pub fn extension_values(&self) -> Option<&[EF]> {
         match self {
             Self::Extension { values, .. } => Some(values),
@@ -188,6 +191,7 @@ impl<F, EF, const DIGEST_ELEMS: usize, W> QueryOpening<F, EF, DIGEST_ELEMS, W> {
     }
 
     /// Returns the Merkle authentication path nodes for this opening.
+    #[must_use]
     pub fn merkle_proof(&self) -> &[[W; DIGEST_ELEMS]] {
         match self {
             Self::Base { proof, .. } | Self::Extension { proof, .. } => proof,
