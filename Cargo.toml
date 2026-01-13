@@ -104,6 +104,10 @@ name = "whir"
 harness = false
 
 [[bench]]
+name = "whir_keccak"
+harness = false
+
+[[bench]]
 name = "evaluate"
 harness = false
 
