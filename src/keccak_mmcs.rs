@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use p3_field::{PackedValue, PrimeField32, PrimeField64};
 use p3_keccak::Keccak256Hash;
@@ -24,12 +24,21 @@ where
     {
         // Preimage = 0x00 || (u32_be(coeff0) || u32_be(coeff1) || ...)
         // where each packed input contributes all its scalar lanes in order.
-        let mut preimage = Vec::<u8>::new();
-        preimage.push(0x00);
-        for packed in input {
+        let packed_items: Vec<P> = input.into_iter().collect();
+        let mut lanes = 0usize;
+        for packed in &packed_items {
+            lanes += packed.as_slice().len();
+        }
+
+        let mut preimage = vec![0u8; 1 + 4 * lanes];
+        preimage[0] = 0x00;
+
+        let mut offset = 1;
+        for packed in packed_items {
             for &x in packed.as_slice() {
-                let w: u32 = x.as_canonical_u32();
-                preimage.extend_from_slice(&w.to_be_bytes());
+                let w = x.as_canonical_u32();
+                preimage[offset..offset + 4].copy_from_slice(&w.to_be_bytes());
+                offset += 4;
             }
         }
         Keccak256Hash.hash_iter(preimage)
