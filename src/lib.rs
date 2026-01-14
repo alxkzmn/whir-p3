@@ -2,7 +2,6 @@
 extern crate alloc;
 
 pub mod constant;
-pub mod errors;
 pub mod fiat_shamir;
 #[cfg(feature = "keccak")]
 pub mod keccak_mmcs;
