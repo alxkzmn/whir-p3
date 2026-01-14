@@ -35,28 +35,6 @@ where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField,
 {
-    /// The size of the current evaluation domain D.
-    ///
-    /// In WHIR, each round operates on a multiplicative subgroup H ⊆ F of size |H| = 2^m.
-    ///
-    /// This field tracks |H| for the current round. The domain shrinks by a factor of
-    /// 2^k in each folding step, where k is the round's folding factor, ensuring
-    /// exponential convergence: |H_0| → |H_1| → ... → |H_final| where |H_{i+1}| = |H_i|/2^k.
-    ///
-    /// This size determines the degree bound for polynomials in the current round and
-    /// directly impacts both prover complexity O(|H| log |H|) and verifier query complexity.
-    pub domain_size: usize,
-
-    /// Generator ω for the next evaluation domain H_{i+1}.
-    ///
-    /// When folding from domain H_i with generator ω_i to smaller domain H_{i+1},
-    /// the new generator is ω_{i+1} = ω_i^{2^k} where k is the folding factor.
-    ///
-    /// This ensures H_{i+1} = {1, ω_{i+1}, ω_{i+1}^2, ..., ω_{i+1}^{|H_{i+1}|-1}}
-    /// remains a multiplicative subgroup with the correct size and structure for
-    /// Reed-Solomon encoding in the subsequent round.
-    pub next_domain_gen: F,
-
     /// Sumcheck prover managing constraint batching and polynomial evaluation.
     ///
     /// In WHIR, the sumcheck protocol enables efficient verification of constraint
@@ -101,20 +79,6 @@ where
     /// The extension field structure enables efficient constraint batching while
     /// preserving the Reed-Solomon proximity properties necessary for soundness.
     pub merkle_prover_data: Option<RoundMerkleTree<F, EF, W, DIGEST_ELEMS>>,
-
-    /// Current constraint set defining the Reed-Solomon proximity testing problem.
-    ///
-    /// The statement contains linear equality constraints of the form
-    /// f(r_j) = v_j for evaluation points r_j ∈ (EF)^n and target values v_j ∈ EF.
-    /// These constraints evolve through rounds as:
-    ///
-    /// 1. **Initial**: Out-of-domain evaluations from the witness
-    /// 2. **Per Round**: New constraints from sumcheck protocol interactions
-    /// 3. **Evolution**: Constraint points updated with folding randomness
-    ///
-    /// The WHIR protocol maintains that satisfying these constraints implies
-    /// the committed polynomial is close to some Reed-Solomon codeword.
-    pub statement: EqStatement<EF>,
 }
 
 #[allow(clippy::mismatching_type_param_order)]
@@ -273,12 +237,6 @@ where
 
         // Initialize complete round state for first WHIR protocol round
         Ok(Self {
-            // Starting domain H_0 with |H_0| = 2^m evaluation points
-            domain_size: prover.starting_domain_size(),
-            // Compute next domain generator: ω_1 = ω_0^{2^k} for H_1 after folding
-            next_domain_gen: F::two_adic_generator(
-                prover.starting_domain_size().ilog2() as usize - prover.folding_factor.at_round(0),
-            ),
             // Sumcheck prover configured for constraint verification
             sumcheck_prover,
             // Current round's folding challenges (α_1, ..., α_k)
@@ -287,8 +245,6 @@ where
             commitment_merkle_prover_data: witness.prover_data,
             // No extension field commitment yet (first round operates in base field)
             merkle_prover_data: None,
-            // Constraint set augmented with OOD evaluations
-            statement,
         })
     }
 }
