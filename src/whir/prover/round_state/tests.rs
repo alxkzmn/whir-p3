@@ -19,9 +19,6 @@ use crate::{
     },
 };
 
-type F = BabyBear;
-type EF4 = BinomialExtensionField<F, 4>;
-
 /// Field/Poseidon-based transcript + Merkle configuration.
 ///
 /// This module is always compiled; when `feature="keccak"` is enabled you’ll get **both**
@@ -34,6 +31,8 @@ mod field {
 
     use super::*;
 
+    type F = BabyBear;
+    type EF4 = BinomialExtensionField<F, 4>;
     type Perm = Poseidon2BabyBear<16>;
     type MyHash = PaddingFreeSponge<Perm, 16, 8, 8>;
     type MyCompress = TruncatedPermutation<Perm, 2, 8, 16>;
@@ -475,6 +474,8 @@ mod keccak {
     use super::*;
     use crate::keccak_mmcs::{KeccakNodeCompress, KeccakU32BeLeafHasher};
 
+    type F = BabyBear;
+    type EF4 = BinomialExtensionField<F, 4>;
     type MyHash = KeccakU32BeLeafHasher;
     type MyCompress = KeccakNodeCompress;
     type MyChallenger = SerializingChallenger32<F, HashChallenger<u8, Keccak256Hash, 32>>;
