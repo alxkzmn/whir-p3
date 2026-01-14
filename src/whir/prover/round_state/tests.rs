@@ -109,12 +109,19 @@ mod field {
             starting_log_inv_rate: params.starting_log_inv_rate,
             rs_domain_initial_reduction_factor: 1,
         };
+
+        // Create WhirProof structure from protocol parameters
+        let whir_proof: WhirProof<F, EF4, DIGEST_ELEMS, F> =
+            WhirProof::from_protocol_parameters(&protocol_params, poly.num_variables());
+
         // Create a new Fiat-Shamir domain separator.
         let mut domsep = DomainSeparator::new(vec![]);
+
         // Observe the public statement into the transcript for binding.
-        domsep.commit_statement::<_, _, _, DIGEST_ELEMS>(params);
+        domsep.commit_statement::<_, _, _, 8>(params);
+
         // Reserve transcript space for WHIR proof messages.
-        domsep.add_whir_proof::<_, _, _, DIGEST_ELEMS>(params);
+        domsep.add_whir_proof::<_, _, _, 8>(params);
 
         // Convert the domain separator into a mutable prover-side transcript.
         let mut rng = SmallRng::seed_from_u64(1);
@@ -125,7 +132,6 @@ mod field {
         let committer = CommitmentWriter::new(params);
 
         let mut proof = WhirProof::from_protocol_parameters(&protocol_params, poly.num_variables());
-
         // Perform DFT-based commitment to the polynomial, producing a witness
         // which includes the Merkle tree and polynomial values.
         let witness = committer
