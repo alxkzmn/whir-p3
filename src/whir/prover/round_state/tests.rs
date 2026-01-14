@@ -1,9 +1,11 @@
 use alloc::vec;
 
-use p3_baby_bear::BabyBear;
+use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
+use p3_challenger::DuplexChallenger;
 use p3_dft::Radix2DFTSmallBatch;
 use p3_field::{PrimeCharacteristicRing, extension::BinomialExtensionField};
 use p3_matrix::dense::DenseMatrix;
+use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 
 use crate::{
     fiat_shamir::domain_separator::DomainSeparator,
@@ -19,24 +21,22 @@ use crate::{
     },
 };
 
+type F = BabyBear;
+type EF4 = BinomialExtensionField<F, 4>;
+type Perm = Poseidon2BabyBear<16>;
+type MyHash = PaddingFreeSponge<Perm, 16, 8, 8>;
+type MyCompress = TruncatedPermutation<Perm, 2, 8, 16>;
+type MyChallenger = DuplexChallenger<F, Perm, 16, 8>;
+
 /// Field/Poseidon-based transcript + Merkle configuration.
 ///
 /// This module is always compiled; when `feature="keccak"` is enabled you’ll get **both**
 /// the field tests and the keccak tests below.
 mod field {
-    use p3_baby_bear::Poseidon2BabyBear;
-    use p3_challenger::DuplexChallenger;
-    use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+
     use rand::{SeedableRng, rngs::SmallRng};
 
     use super::*;
-
-    type F = BabyBear;
-    type EF4 = BinomialExtensionField<F, 4>;
-    type Perm = Poseidon2BabyBear<16>;
-    type MyHash = PaddingFreeSponge<Perm, 16, 8, 8>;
-    type MyCompress = TruncatedPermutation<Perm, 2, 8, 16>;
-    type MyChallenger = DuplexChallenger<F, Perm, 16, 8>;
 
     /// Poseidon-based Merkle digests are `[F; 8]` with the current sponge parameters.
     const DIGEST_ELEMS: usize = 8;
