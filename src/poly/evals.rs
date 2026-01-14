@@ -1,4 +1,4 @@
-use alloc::{format, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 
 use itertools::Itertools;
 use p3_field::{
@@ -1215,7 +1215,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use alloc::vec;
+    use alloc::{format, vec};
 
     use p3_baby_bear::BabyBear;
     use p3_field::{
