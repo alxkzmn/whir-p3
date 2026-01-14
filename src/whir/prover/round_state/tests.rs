@@ -28,6 +28,9 @@ type MyHash = PaddingFreeSponge<Perm, 16, 8, 8>;
 type MyCompress = TruncatedPermutation<Perm, 2, 8, 16>;
 type MyChallenger = DuplexChallenger<F, Perm, 16, 8>;
 
+/// Poseidon-based Merkle digests are `[F; 8]` with the current sponge parameters.
+const DIGEST_ELEMS: usize = 8;
+
 /// Field/Poseidon-based transcript + Merkle configuration.
 ///
 /// This module is always compiled; when `feature="keccak"` is enabled you’ll get **both**
@@ -37,9 +40,6 @@ mod field {
     use rand::{SeedableRng, rngs::SmallRng};
 
     use super::*;
-
-    /// Poseidon-based Merkle digests are `[F; 8]` with the current sponge parameters.
-    const DIGEST_ELEMS: usize = 8;
 
     /// Create a WHIR protocol configuration for test scenarios.
     ///
