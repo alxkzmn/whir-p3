@@ -778,7 +778,10 @@ mod tests {
     use alloc::vec;
 
     use p3_baby_bear::BabyBear;
-    use p3_field::{ExtensionField, Field, PackedValue, PrimeCharacteristicRing, extension::BinomialExtensionField};
+    use p3_field::{
+        ExtensionField, Field, PackedValue, PrimeCharacteristicRing,
+        extension::BinomialExtensionField,
+    };
     use proptest::prelude::*;
     use rand::{SeedableRng, rngs::SmallRng};
 
@@ -842,116 +845,6 @@ mod tests {
 
         assert_eq!(combined_evals, expected_combined_evals_vec);
         assert_eq!(combined_sum, expected_combined_sum);
-    }
-
-    #[test]
-    fn test_packed_and_unpacked_match_with_linear_constraints() {
-        // This test guards against divergences between the packed and unpacked batching paths.
-        // It specifically includes explicit linear constraints (used by EqRotateRight).
-        type Base = F;
-
-        // Ensure k is large enough to exercise the packed path.
-        let k = 8;
-        let k_pack = log2_strict_usize(<Base as Field>::Packing::WIDTH);
-        assert!(k >= k_pack);
-
-        let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
-        let mut statement = EqStatement::<F>::initialize(k);
-
-        // Add a couple of point constraints.
-        for _ in 0..2 {
-            let point =
-                MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
-            let eval = F::from_u64(rng.random::<u32>() as u64);
-            statement.add_evaluated_constraint(point, eval);
-        }
-
-        // Add a couple of explicit linear constraints.
-        for _ in 0..2 {
-            let weights = (0..(1 << k))
-                .map(|_| F::from_u64((rng.random::<u32>() % 97) as u64))
-                .collect::<Vec<_>>();
-            let eval = F::from_u64(rng.random::<u32>() as u64);
-            statement.add_linear_constraint(EvaluationsList::new(weights), eval);
-        }
-
-        let gamma = F::from_u64(7);
-
-        // Unpacked combination.
-        let mut weights_unpacked = EvaluationsList::zero(k);
-        let mut sum_unpacked = F::ZERO;
-        statement.combine_hypercube::<Base, false>(
-            &mut weights_unpacked,
-            &mut sum_unpacked,
-            gamma,
-        );
-
-        // Packed combination (outputs 2^(k-k_pack) packed field elements).
-        let mut weights_packed =
-            EvaluationsList::<<F as ExtensionField<Base>>::ExtensionPacking>::zero(k - k_pack);
-        let mut sum_packed = F::ZERO;
-        statement.combine_hypercube_packed::<Base, false>(
-            &mut weights_packed,
-            &mut sum_packed,
-            gamma,
-        );
-
-        assert_eq!(sum_unpacked, sum_packed);
-
-        // Unpack and compare the full evaluation table.
-        let mut unpacked = Vec::with_capacity(1 << k);
-        for packed in &weights_packed.0 {
-            let slice: &[F] = PackedValue::as_slice(packed);
-            unpacked.extend_from_slice(slice);
-        }
-        unpacked.truncate(1 << k);
-
-        assert_eq!(unpacked, weights_unpacked.0);
-    }
-
-    #[test]
-    fn test_combined_weights_satisfy_claim_with_linear_constraints() {
-        // For any polynomial p (given in evaluation form), if we set each constraint's expected
-        // value to the *true* evaluation/linear-functional result, then the combined weight table
-        // W produced by batching must satisfy: <p, W> = S.
-        // This is the algebraic invariant required by the WHIR sumcheck.
-
-        let mut rng = SmallRng::seed_from_u64(0xDEADBEEF);
-        let k = 8;
-
-        // Random polynomial in evaluation form over {0,1}^k.
-        let poly_vals = (0..(1 << k))
-            .map(|_| F::from_u64((rng.random::<u32>() % 1_000) as u64))
-            .collect::<Vec<_>>();
-        let poly = EvaluationsList::new(poly_vals);
-
-        let mut statement = EqStatement::<F>::initialize(k);
-
-        // Point constraints: expected = p(point).
-        for _ in 0..3 {
-            let point =
-                MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
-            let expected = poly.evaluate_hypercube_base::<F>(&point);
-            statement.add_evaluated_constraint(point, expected);
-        }
-
-        // Linear constraints: expected = <poly, weights>.
-        for _ in 0..3 {
-            let weights = (0..(1 << k))
-                .map(|_| F::from_u64((rng.random::<u32>() % 97) as u64))
-                .collect::<Vec<_>>();
-            let weights = EvaluationsList::new(weights);
-            let expected = dot_product::<F, _, _>(poly.iter().copied(), weights.iter().copied());
-            statement.add_linear_constraint(weights, expected);
-        }
-
-        let gamma = F::from_u64(11);
-        let mut combined_weights = EvaluationsList::zero(k);
-        let mut combined_sum = F::ZERO;
-        statement.combine_hypercube::<F, false>(&mut combined_weights, &mut combined_sum, gamma);
-
-        let lhs = dot_product::<F, _, _>(poly.iter().copied(), combined_weights.iter().copied());
-        assert_eq!(lhs, combined_sum);
     }
 
     #[test]
@@ -1499,5 +1392,109 @@ mod tests {
                 assert_eq!(sum0, sum1);
             }
         }
+    }
+
+    #[test]
+    fn test_packed_and_unpacked_match_with_linear_constraints() {
+        // This test guards against divergences between the packed and unpacked batching paths.
+        // It specifically includes explicit linear constraints (used by EqRotateRight).
+        type Base = F;
+
+        // Ensure k is large enough to exercise the packed path.
+        let k = 8;
+        let k_pack = log2_strict_usize(<Base as Field>::Packing::WIDTH);
+        assert!(k >= k_pack);
+
+        let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Add a couple of point constraints.
+        for _ in 0..2 {
+            let point = MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+            let eval = F::from_u64(rng.random::<u32>() as u64);
+            statement.add_evaluated_constraint(point, eval);
+        }
+
+        // Add a couple of explicit linear constraints.
+        for _ in 0..2 {
+            let weights = (0..(1 << k))
+                .map(|_| F::from_u64((rng.random::<u32>() % 97) as u64))
+                .collect::<Vec<_>>();
+            let eval = F::from_u64(rng.random::<u32>() as u64);
+            statement.add_linear_constraint(EvaluationsList::new(weights), eval);
+        }
+
+        let gamma = F::from_u64(7);
+
+        // Unpacked combination.
+        let mut weights_unpacked = EvaluationsList::zero(k);
+        let mut sum_unpacked = F::ZERO;
+        statement.combine_hypercube::<Base, false>(&mut weights_unpacked, &mut sum_unpacked, gamma);
+
+        // Packed combination (outputs 2^(k-k_pack) packed field elements).
+        let mut weights_packed =
+            EvaluationsList::<<F as ExtensionField<Base>>::ExtensionPacking>::zero(k - k_pack);
+        let mut sum_packed = F::ZERO;
+        statement.combine_hypercube_packed::<Base, false>(
+            &mut weights_packed,
+            &mut sum_packed,
+            gamma,
+        );
+
+        assert_eq!(sum_unpacked, sum_packed);
+
+        // Unpack and compare the full evaluation table.
+        let mut unpacked = Vec::with_capacity(1 << k);
+        for packed in &weights_packed.0 {
+            let slice: &[F] = PackedValue::as_slice(packed);
+            unpacked.extend_from_slice(slice);
+        }
+        unpacked.truncate(1 << k);
+
+        assert_eq!(unpacked, weights_unpacked.0);
+    }
+
+    #[test]
+    fn test_combined_weights_satisfy_claim_with_linear_constraints() {
+        // For any polynomial p (given in evaluation form), if we set each constraint's expected
+        // value to the *true* evaluation/linear-functional result, then the combined weight table
+        // W produced by batching must satisfy: <p, W> = S.
+        // This is the algebraic invariant required by the WHIR sumcheck.
+
+        let mut rng = SmallRng::seed_from_u64(0xDEADBEEF);
+        let k = 8;
+
+        // Random polynomial in evaluation form over {0,1}^k.
+        let poly_vals = (0..(1 << k))
+            .map(|_| F::from_u64((rng.random::<u32>() % 1_000) as u64))
+            .collect::<Vec<_>>();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Point constraints: expected = p(point).
+        for _ in 0..3 {
+            let point = MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+            let expected = poly.evaluate_hypercube_base::<F>(&point);
+            statement.add_evaluated_constraint(point, expected);
+        }
+
+        // Linear constraints: expected = <poly, weights>.
+        for _ in 0..3 {
+            let weights = (0..(1 << k))
+                .map(|_| F::from_u64((rng.random::<u32>() % 97) as u64))
+                .collect::<Vec<_>>();
+            let weights = EvaluationsList::new(weights);
+            let expected = dot_product::<F, _, _>(poly.iter().copied(), weights.iter().copied());
+            statement.add_linear_constraint(weights, expected);
+        }
+
+        let gamma = F::from_u64(11);
+        let mut combined_weights = EvaluationsList::zero(k);
+        let mut combined_sum = F::ZERO;
+        statement.combine_hypercube::<F, false>(&mut combined_weights, &mut combined_sum, gamma);
+
+        let lhs = dot_product::<F, _, _>(poly.iter().copied(), combined_weights.iter().copied());
+        assert_eq!(lhs, combined_sum);
     }
 }
