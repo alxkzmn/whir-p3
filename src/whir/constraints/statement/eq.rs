@@ -105,6 +105,15 @@ pub struct EqStatement<F> {
     pub(crate) points: Vec<MultilinearPoint<F>>,
     /// List of target evaluations.
     pub(crate) evaluations: Vec<F>,
+
+    /// Explicit linear constraints of the form: <weights, poly_evals> = eval.
+    ///
+    /// Each entry stores the full weight vector over the Boolean hypercube `{0,1}^num_variables`.
+    /// This is used for constraints that cannot be expressed as a point evaluation (e.g. rotated
+    /// evaluation vectors / other linear functionals).
+    pub(crate) linear_weights: Vec<EvaluationsList<F>>,
+    /// Expected evaluations corresponding to `linear_weights`.
+    pub(crate) linear_evaluations: Vec<F>,
 }
 
 impl<F: Field> EqStatement<F> {
@@ -115,6 +124,8 @@ impl<F: Field> EqStatement<F> {
             num_variables,
             points: Vec::new(),
             evaluations: Vec::new(),
+            linear_weights: Vec::new(),
+            linear_evaluations: Vec::new(),
         }
     }
 
@@ -149,6 +160,8 @@ impl<F: Field> EqStatement<F> {
             num_variables,
             points,
             evaluations,
+            linear_weights: Vec::new(),
+            linear_evaluations: Vec::new(),
         }
     }
 
@@ -222,6 +235,8 @@ impl<F: Field> EqStatement<F> {
             num_variables,
             points,
             evaluations,
+            linear_weights: Vec::new(),
+            linear_evaluations: Vec::new(),
         }
     }
 
@@ -235,7 +250,8 @@ impl<F: Field> EqStatement<F> {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         debug_assert!(self.points.is_empty() == self.evaluations.is_empty());
-        self.points.is_empty()
+        debug_assert!(self.linear_weights.is_empty() == self.linear_evaluations.is_empty());
+        self.points.is_empty() && self.linear_weights.is_empty()
     }
 
     /// Returns an iterator over the evaluation constraints in the statement.
@@ -247,14 +263,34 @@ impl<F: Field> EqStatement<F> {
     #[must_use]
     pub const fn len(&self) -> usize {
         debug_assert!(self.points.len() == self.evaluations.len());
-        self.points.len()
+        debug_assert!(self.linear_weights.len() == self.linear_evaluations.len());
+        self.points.len() + self.linear_weights.len()
+    }
+
+    /// Returns true if this statement contains any explicit linear constraints.
+    ///
+    /// These constraints are not point evaluations and may not be compatible with
+    /// sumcheck optimizations that assume equality polynomials only.
+    #[must_use]
+    pub const fn has_linear_constraints(&self) -> bool {
+        !self.linear_weights.is_empty()
     }
 
     /// Verifies that a given polynomial satisfies all constraints in the statement.
     #[must_use]
     pub fn verify(&self, poly: &EvaluationsList<F>) -> bool {
-        self.iter()
-            .all(|(point, &expected_eval)| poly.evaluate_hypercube_base(point) == expected_eval)
+        let points_ok = self
+            .iter()
+            .all(|(point, &expected_eval)| poly.evaluate_hypercube_base(point) == expected_eval);
+        let linear_ok = self
+            .linear_weights
+            .iter()
+            .zip(self.linear_evaluations.iter())
+            .all(|(weights, &expected)| {
+                debug_assert_eq!(weights.num_variables(), self.num_variables());
+                dot_product::<F, _, _>(poly.iter().copied(), weights.iter().copied()) == expected
+            });
+        points_ok && linear_ok
     }
 
     /// Concatenates another statement's constraints into this one.
@@ -262,6 +298,10 @@ impl<F: Field> EqStatement<F> {
         assert_eq!(self.num_variables, other.num_variables);
         self.points.extend_from_slice(&other.points);
         self.evaluations.extend_from_slice(&other.evaluations);
+
+        self.linear_weights.extend_from_slice(&other.linear_weights);
+        self.linear_evaluations
+            .extend_from_slice(&other.linear_evaluations);
     }
 
     /// Adds an evaluation constraint `p(z) = s` to the system.
@@ -302,6 +342,15 @@ impl<F: Field> EqStatement<F> {
         self.evaluations.push(eval);
     }
 
+    /// Adds an explicit linear constraint of the form `<weights, poly_evals> = eval`.
+    ///
+    /// `weights` must contain `2^num_variables` evaluations over the Boolean hypercube.
+    pub fn add_linear_constraint(&mut self, weights: EvaluationsList<F>, eval: F) {
+        assert_eq!(weights.num_variables(), self.num_variables());
+        self.linear_weights.push(weights);
+        self.linear_evaluations.push(eval);
+    }
+
     /// Inserts multiple constraints at the front of the system.
     ///
     /// Panics if any constraint's number of variables does not match the system.
@@ -325,47 +374,77 @@ impl<F: Field> EqStatement<F> {
         // If there are no constraints, the combination is:
         // - The combined polynomial W(X) is identically zero (all evaluations = 0).
         // - The combined expected sum S is zero.
-        if self.points.is_empty() {
+        if self.is_empty() {
             return;
         }
 
-        let num_constraints = self.len();
+        let num_point_constraints = self.points.len();
+        let num_linear_constraints = self.linear_weights.len();
+        let num_constraints = num_point_constraints + num_linear_constraints;
         let num_variables = self.num_variables();
 
         // Precompute challenge powers γ^i for i = 0..num_constraints-1.
         let challenges = challenge.powers().collect_n(num_constraints);
 
-        // Create a matrix where each column is one evaluation point.
-        //
-        // Matrix layout:
-        // - rows are variables,
-        // - columns are evaluation points.
-        let points_data = F::zero_vec(num_variables * num_constraints);
-        let mut points_matrix = RowMajorMatrix::new(points_data, num_constraints);
+        if num_point_constraints > 0 {
+            // Create a matrix where each column is one evaluation point.
+            //
+            // Matrix layout:
+            // - rows are variables,
+            // - columns are evaluation points.
+            let points_data = F::zero_vec(num_variables * num_point_constraints);
+            let mut points_matrix = RowMajorMatrix::new(points_data, num_point_constraints);
 
-        // Parallelize the transpose operation over rows (variables).
-        //
-        // Each thread writes to its own contiguous row, which is cache-friendly.
-        points_matrix
-            .rows_mut()
-            .enumerate()
-            .for_each(|(var_idx, row_slice)| {
-                for (col_idx, point) in self.points.iter().enumerate() {
-                    row_slice[col_idx] = point[var_idx];
-                }
-            });
+            // Parallelize the transpose operation over rows (variables).
+            //
+            // Each thread writes to its own contiguous row, which is cache-friendly.
+            points_matrix
+                .rows_mut()
+                .enumerate()
+                .for_each(|(var_idx, row_slice)| {
+                    for (col_idx, point) in self.points.iter().enumerate() {
+                        row_slice[col_idx] = point[var_idx];
+                    }
+                });
 
-        // Compute the batched equality polynomial evaluations.
-        // This computes W(x) = ∑_i γ^i * eq(x, z_i) for all x ∈ {0,1}^k.
-        eval_eq_batch::<Base, F, INITIALIZED>(
-            points_matrix.as_view(),
-            &mut acc_weights.0,
-            &challenges,
-        );
+            // Compute the batched equality polynomial evaluations.
+            // This computes: ∑_i γ^i * eq(x, z_i)
+            eval_eq_batch::<Base, F, INITIALIZED>(
+                points_matrix.as_view(),
+                &mut acc_weights.0,
+                &challenges[..num_point_constraints],
+            );
 
-        // Combine expected evaluations: S = ∑_i γ^i * s_i
-        *acc_sum +=
-            dot_product::<F, _, _>(self.evaluations.iter().copied(), challenges.into_iter());
+            // Combine expected evaluations for point constraints.
+            *acc_sum += dot_product::<F, _, _>(
+                self.evaluations.iter().copied(),
+                challenges[..num_point_constraints].iter().copied(),
+            );
+        }
+
+        if num_linear_constraints > 0 {
+            self.linear_weights
+                .iter()
+                .zip(self.linear_evaluations.iter())
+                .enumerate()
+                .for_each(|(j, (weights, &expected))| {
+                    let alpha = challenges[num_point_constraints + j];
+                    if INITIALIZED || num_point_constraints > 0 || j > 0 {
+                        acc_weights
+                            .0
+                            .iter_mut()
+                            .zip(weights.iter().copied())
+                            .for_each(|(out, w)| *out += alpha * w);
+                    } else {
+                        acc_weights
+                            .0
+                            .iter_mut()
+                            .zip(weights.iter().copied())
+                            .for_each(|(out, w)| *out = alpha * w);
+                    }
+                    *acc_sum += alpha * expected;
+                });
+        }
     }
 
     /// Inserts multiple constraints at the front of the system.
@@ -388,9 +467,14 @@ impl<F: Field> EqStatement<F> {
         Base: Field,
         F: ExtensionField<Base>,
     {
-        if self.points.is_empty() {
+        if self.is_empty() {
             return;
         }
+
+        let num_point_constraints = self.points.len();
+        let num_linear_constraints = self.linear_weights.len();
+        let num_constraints = num_point_constraints + num_linear_constraints;
+        let challenges = challenge.powers().collect_n(num_constraints);
 
         let k = self.num_variables();
         let k_pack = log2_strict_usize(Base::Packing::WIDTH);
@@ -404,10 +488,10 @@ impl<F: Field> EqStatement<F> {
         if k_pack * 2 > k {
             self.points
                 .iter()
-                .zip(challenge.powers())
+                .zip(challenges.iter().copied())
                 .enumerate()
-                .for_each(|(i, (point, challenge))| {
-                    let eq = EvaluationsList::new_from_point(point.as_slice(), challenge);
+                .for_each(|(i, (point, alpha))| {
+                    let eq = EvaluationsList::new_from_point(point.as_slice(), alpha);
                     weights
                         .0
                         .iter_mut()
@@ -421,28 +505,79 @@ impl<F: Field> EqStatement<F> {
                             }
                         });
                 });
+
+            self.linear_weights
+                .iter()
+                .zip(self.linear_evaluations.iter())
+                .enumerate()
+                .for_each(|(j, (w, _expected))| {
+                    let alpha = challenges[num_point_constraints + j];
+                    let alpha_packed = F::ExtensionPacking::from(alpha);
+                    weights
+                        .0
+                        .iter_mut()
+                        .zip_eq(w.0.chunks(Base::Packing::WIDTH))
+                        .for_each(|(out, chunk)| {
+                            let packed = F::ExtensionPacking::from_ext_slice(chunk);
+                            if INITIALIZED || num_point_constraints > 0 || j > 0 {
+                                *out += alpha_packed * packed;
+                            } else {
+                                *out = alpha_packed * packed;
+                            }
+                        });
+                });
+
             return;
         }
 
-        let points = MultilinearPoint::transpose(&self.points, true);
-        let (left, right) = points.split_rows(k / 2);
-        let left = packed_batch_eqs::<Base, F>(left);
-        let right = batch_eqs::<Base, F>(right, challenge);
+        if num_point_constraints > 0 {
+            let points = MultilinearPoint::transpose(&self.points, true);
+            let (left, right) = points.split_rows(k / 2);
+            let left = packed_batch_eqs::<Base, F>(left);
+            let right = batch_eqs::<Base, F>(right, challenge);
 
-        weights
-            .0
-            .par_chunks_mut(left.height())
-            .zip_eq(right.par_row_slices())
-            .for_each(|(out, right)| {
-                out.iter_mut().zip(left.rows()).for_each(|(out, left)| {
-                    if INITIALIZED {
-                        *out +=
-                            dot_product::<F::ExtensionPacking, _, _>(left, right.iter().copied());
-                    } else {
-                        *out = dot_product(left, right.iter().copied());
-                    }
+            weights
+                .0
+                .par_chunks_mut(left.height())
+                .zip_eq(right.par_row_slices())
+                .for_each(|(out, right)| {
+                    out.iter_mut().zip(left.rows()).for_each(|(out, left)| {
+                        if INITIALIZED {
+                            *out += dot_product::<F::ExtensionPacking, _, _>(
+                                left,
+                                right.iter().copied(),
+                            );
+                        } else {
+                            *out = dot_product(left, right.iter().copied());
+                        }
+                    });
                 });
+        } else if !INITIALIZED {
+            // Ensure the accumulator is properly initialized to zero if this is the first writer.
+            weights
+                .0
+                .iter_mut()
+                .for_each(|w| *w = F::ExtensionPacking::ZERO);
+        }
+
+        if num_linear_constraints > 0 {
+            self.linear_weights.iter().enumerate().for_each(|(j, w)| {
+                let alpha = challenges[num_point_constraints + j];
+                let alpha_packed = F::ExtensionPacking::from(alpha);
+                weights
+                    .0
+                    .iter_mut()
+                    .zip_eq(w.0.chunks(Base::Packing::WIDTH))
+                    .for_each(|(out, chunk)| {
+                        let packed = F::ExtensionPacking::from_ext_slice(chunk);
+                        if INITIALIZED || num_point_constraints > 0 || j > 0 {
+                            *out += alpha_packed * packed;
+                        } else {
+                            *out = alpha_packed * packed;
+                        }
+                    });
             });
+        }
     }
 
     /// Combines a list of evals into a single linear combination using powers of `gamma`,
@@ -452,7 +587,14 @@ impl<F: Field> EqStatement<F> {
     /// - `claimed_eval`: Mutable reference to the total accumulated claimed eval so far. Updated in place.
     /// - `gamma`: A random extension field element used to weight the evals.
     pub fn combine_evals(&self, claimed_eval: &mut F, gamma: F) {
-        *claimed_eval += dot_product(self.evaluations.iter().copied(), gamma.powers());
+        let total = self.len();
+        *claimed_eval += dot_product::<F, _, _>(
+            self.evaluations
+                .iter()
+                .copied()
+                .chain(self.linear_evaluations.iter().copied()),
+            gamma.powers().take(total),
+        );
     }
 
     /// Computes the equality polynomial for a point over a multiplicative subgroup domain.
@@ -636,7 +778,7 @@ mod tests {
     use alloc::vec;
 
     use p3_baby_bear::BabyBear;
-    use p3_field::{PrimeCharacteristicRing, extension::BinomialExtensionField};
+    use p3_field::{ExtensionField, Field, PackedValue, PrimeCharacteristicRing, extension::BinomialExtensionField};
     use proptest::prelude::*;
     use rand::{SeedableRng, rngs::SmallRng};
 
@@ -700,6 +842,116 @@ mod tests {
 
         assert_eq!(combined_evals, expected_combined_evals_vec);
         assert_eq!(combined_sum, expected_combined_sum);
+    }
+
+    #[test]
+    fn test_packed_and_unpacked_match_with_linear_constraints() {
+        // This test guards against divergences between the packed and unpacked batching paths.
+        // It specifically includes explicit linear constraints (used by EqRotateRight).
+        type Base = F;
+
+        // Ensure k is large enough to exercise the packed path.
+        let k = 8;
+        let k_pack = log2_strict_usize(<Base as Field>::Packing::WIDTH);
+        assert!(k >= k_pack);
+
+        let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Add a couple of point constraints.
+        for _ in 0..2 {
+            let point =
+                MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+            let eval = F::from_u64(rng.random::<u32>() as u64);
+            statement.add_evaluated_constraint(point, eval);
+        }
+
+        // Add a couple of explicit linear constraints.
+        for _ in 0..2 {
+            let weights = (0..(1 << k))
+                .map(|_| F::from_u64((rng.random::<u32>() % 97) as u64))
+                .collect::<Vec<_>>();
+            let eval = F::from_u64(rng.random::<u32>() as u64);
+            statement.add_linear_constraint(EvaluationsList::new(weights), eval);
+        }
+
+        let gamma = F::from_u64(7);
+
+        // Unpacked combination.
+        let mut weights_unpacked = EvaluationsList::zero(k);
+        let mut sum_unpacked = F::ZERO;
+        statement.combine_hypercube::<Base, false>(
+            &mut weights_unpacked,
+            &mut sum_unpacked,
+            gamma,
+        );
+
+        // Packed combination (outputs 2^(k-k_pack) packed field elements).
+        let mut weights_packed =
+            EvaluationsList::<<F as ExtensionField<Base>>::ExtensionPacking>::zero(k - k_pack);
+        let mut sum_packed = F::ZERO;
+        statement.combine_hypercube_packed::<Base, false>(
+            &mut weights_packed,
+            &mut sum_packed,
+            gamma,
+        );
+
+        assert_eq!(sum_unpacked, sum_packed);
+
+        // Unpack and compare the full evaluation table.
+        let mut unpacked = Vec::with_capacity(1 << k);
+        for packed in &weights_packed.0 {
+            let slice: &[F] = PackedValue::as_slice(packed);
+            unpacked.extend_from_slice(slice);
+        }
+        unpacked.truncate(1 << k);
+
+        assert_eq!(unpacked, weights_unpacked.0);
+    }
+
+    #[test]
+    fn test_combined_weights_satisfy_claim_with_linear_constraints() {
+        // For any polynomial p (given in evaluation form), if we set each constraint's expected
+        // value to the *true* evaluation/linear-functional result, then the combined weight table
+        // W produced by batching must satisfy: <p, W> = S.
+        // This is the algebraic invariant required by the WHIR sumcheck.
+
+        let mut rng = SmallRng::seed_from_u64(0xDEADBEEF);
+        let k = 8;
+
+        // Random polynomial in evaluation form over {0,1}^k.
+        let poly_vals = (0..(1 << k))
+            .map(|_| F::from_u64((rng.random::<u32>() % 1_000) as u64))
+            .collect::<Vec<_>>();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Point constraints: expected = p(point).
+        for _ in 0..3 {
+            let point =
+                MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+            let expected = poly.evaluate_hypercube_base::<F>(&point);
+            statement.add_evaluated_constraint(point, expected);
+        }
+
+        // Linear constraints: expected = <poly, weights>.
+        for _ in 0..3 {
+            let weights = (0..(1 << k))
+                .map(|_| F::from_u64((rng.random::<u32>() % 97) as u64))
+                .collect::<Vec<_>>();
+            let weights = EvaluationsList::new(weights);
+            let expected = dot_product::<F, _, _>(poly.iter().copied(), weights.iter().copied());
+            statement.add_linear_constraint(weights, expected);
+        }
+
+        let gamma = F::from_u64(11);
+        let mut combined_weights = EvaluationsList::zero(k);
+        let mut combined_sum = F::ZERO;
+        statement.combine_hypercube::<F, false>(&mut combined_weights, &mut combined_sum, gamma);
+
+        let lhs = dot_product::<F, _, _>(poly.iter().copied(), combined_weights.iter().copied());
+        assert_eq!(lhs, combined_sum);
     }
 
     #[test]
