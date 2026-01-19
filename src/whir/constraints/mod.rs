@@ -354,7 +354,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
 
         // Explicit linear functionals are not supported in the univariate-skip optimization.
         assert!(
-            self.eq_statement.linear_weights.is_empty(),
+            !self.eq_statement.has_linear_constraints(),
             "linear equality constraints not supported in skip case"
         );
     }

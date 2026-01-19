@@ -1,10 +1,13 @@
 use alloc::{vec, vec::Vec};
 
 use p3_field::{ExtensionField, Field, TwoAdicField};
+use p3_util::log2_strict_usize;
 
 use crate::{
-    constant::K_SKIP_SUMCHECK, parameters::FoldingFactor, poly::multilinear::MultilinearPoint,
-    whir::constraints::Constraint,
+    constant::K_SKIP_SUMCHECK,
+    parameters::FoldingFactor,
+    poly::multilinear::MultilinearPoint,
+    whir::constraints::{Constraint, statement::eq::LinearConstraint},
 };
 
 /// Evaluate a single round's constraint.
@@ -78,7 +81,40 @@ fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
             .linear_weights
             .iter()
             .zip(constraint.challenge.powers().skip(point_eq_count))
-            .map(|(weights, coeff)| weights.evaluate_hypercube_ext::<F>(&eval_point) * coeff)
+            .map(|(weights, coeff)| match weights {
+                LinearConstraint::Dense(weights) => {
+                    weights.evaluate_hypercube_ext::<F>(&eval_point) * coeff
+                }
+                LinearConstraint::TensorProduct {
+                    range_start,
+                    log_range_len,
+                    row_weights,
+                    col_weights,
+                } => {
+                    let num_vars = constraint.eq_statement.num_variables();
+                    let row_len = col_weights.num_evals();
+                    let log_row_len = log2_strict_usize(row_len);
+                    let log_rows = *log_range_len - log_row_len;
+                    let high_bits = num_vars - *log_range_len;
+                    let point_slice = eval_point.as_slice();
+                    let (high_slice, rest) = point_slice.split_at(high_bits);
+                    let (row_slice, col_slice) = rest.split_at(log_rows);
+
+                    let mut fixed_bits = (*log_range_len..num_vars)
+                        .map(|i| EF::from_bool(((*range_start >> i) & 1) == 1))
+                        .collect::<Vec<_>>();
+                    fixed_bits.reverse();
+                    let fixed_eq = MultilinearPoint::new(fixed_bits)
+                        .eq_poly(&MultilinearPoint::new(high_slice.to_vec()));
+
+                    let row_eval = row_weights
+                        .evaluate_hypercube_ext::<F>(&MultilinearPoint::new(row_slice.to_vec()));
+                    let col_eval = col_weights
+                        .evaluate_hypercube_ext::<F>(&MultilinearPoint::new(col_slice.to_vec()));
+
+                    fixed_eq * row_eval * col_eval * coeff
+                }
+            })
             .sum::<EF>()
     };
 

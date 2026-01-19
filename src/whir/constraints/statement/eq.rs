@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use itertools::Itertools;
 use p3_field::{
@@ -98,6 +98,17 @@ fn packed_batch_eqs<F: Field, EF: ExtensionField<F>>(
 /// - `points.len() == evaluations.len()`.
 /// - Every `MultilinearPoint` in `points` has exactly `num_variables` coordinates.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinearConstraint<F> {
+    Dense(EvaluationsList<F>),
+    TensorProduct {
+        range_start: usize,
+        log_range_len: usize,
+        row_weights: EvaluationsList<F>,
+        col_weights: EvaluationsList<F>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EqStatement<F> {
     /// Number of variables in the multilinear polynomial space.
     num_variables: usize,
@@ -111,7 +122,7 @@ pub struct EqStatement<F> {
     /// Each entry stores the full weight vector over the Boolean hypercube `{0,1}^num_variables`.
     /// This is used for constraints that cannot be expressed as a point evaluation (e.g. rotated
     /// evaluation vectors / other linear functionals).
-    pub(crate) linear_weights: Vec<EvaluationsList<F>>,
+    pub(crate) linear_weights: Vec<LinearConstraint<F>>,
     /// Expected evaluations corresponding to `linear_weights`.
     pub(crate) linear_evaluations: Vec<F>,
 }
@@ -286,9 +297,34 @@ impl<F: Field> EqStatement<F> {
             .linear_weights
             .iter()
             .zip(self.linear_evaluations.iter())
-            .all(|(weights, &expected)| {
-                debug_assert_eq!(weights.num_variables(), self.num_variables());
-                dot_product::<F, _, _>(poly.iter().copied(), weights.iter().copied()) == expected
+            .all(|(weights, &expected)| match weights {
+                LinearConstraint::Dense(weights) => {
+                    debug_assert_eq!(weights.num_variables(), self.num_variables());
+                    dot_product::<F, _, _>(poly.iter().copied(), weights.iter().copied())
+                        == expected
+                }
+                LinearConstraint::TensorProduct {
+                    range_start,
+                    log_range_len,
+                    row_weights,
+                    col_weights,
+                } => {
+                    let range_len = 1usize << log_range_len;
+                    let row_len = col_weights.num_evals();
+                    let rows = row_weights.num_evals();
+                    debug_assert_eq!(row_len * rows, range_len);
+                    let mut total = F::ZERO;
+                    poly.as_slice()[*range_start..*range_start + range_len]
+                        .chunks(row_len)
+                        .zip(row_weights.0.iter().copied())
+                        .for_each(|(poly_row, row_w)| {
+                            total += dot_product::<F, _, _>(
+                                poly_row.iter().copied(),
+                                col_weights.0.iter().copied(),
+                            ) * row_w;
+                        });
+                    total == expected
+                }
             });
         points_ok && linear_ok
     }
@@ -347,7 +383,33 @@ impl<F: Field> EqStatement<F> {
     /// `weights` must contain `2^num_variables` evaluations over the Boolean hypercube.
     pub fn add_linear_constraint(&mut self, weights: EvaluationsList<F>, eval: F) {
         assert_eq!(weights.num_variables(), self.num_variables());
-        self.linear_weights.push(weights);
+        self.linear_weights.push(LinearConstraint::Dense(weights));
+        self.linear_evaluations.push(eval);
+    }
+
+    /// Adds an explicit linear constraint with tensor-product structure over a contiguous range.
+    ///
+    /// The effective weight vector is zero outside `[range_start, range_start + 2^log_range_len)`.
+    /// Inside the range, weights are `row_weights \otimes col_weights` in row-major order.
+    pub fn add_tensor_product_constraint(
+        &mut self,
+        range_start: usize,
+        log_range_len: usize,
+        row_weights: EvaluationsList<F>,
+        col_weights: EvaluationsList<F>,
+        eval: F,
+    ) {
+        let range_len = 1usize << log_range_len;
+        let row_len = col_weights.num_evals();
+        let rows = row_weights.num_evals();
+        assert_eq!(row_len * rows, range_len);
+        assert_eq!(range_start % range_len, 0);
+        self.linear_weights.push(LinearConstraint::TensorProduct {
+            range_start,
+            log_range_len,
+            row_weights,
+            col_weights,
+        });
         self.linear_evaluations.push(eval);
     }
 
@@ -423,26 +485,60 @@ impl<F: Field> EqStatement<F> {
         }
 
         if num_linear_constraints > 0 {
+            let mut initialized = INITIALIZED || num_point_constraints > 0;
             self.linear_weights
                 .iter()
                 .zip(self.linear_evaluations.iter())
                 .enumerate()
                 .for_each(|(j, (weights, &expected))| {
                     let alpha = challenges[num_point_constraints + j];
-                    if INITIALIZED || num_point_constraints > 0 || j > 0 {
-                        acc_weights
-                            .0
-                            .iter_mut()
-                            .zip(weights.iter().copied())
-                            .for_each(|(out, w)| *out += alpha * w);
-                    } else {
-                        acc_weights
-                            .0
-                            .iter_mut()
-                            .zip(weights.iter().copied())
-                            .for_each(|(out, w)| *out = alpha * w);
+                    match weights {
+                        LinearConstraint::Dense(weights) => {
+                            if initialized {
+                                acc_weights
+                                    .0
+                                    .iter_mut()
+                                    .zip(weights.iter().copied())
+                                    .for_each(|(out, w)| *out += alpha * w);
+                            } else {
+                                acc_weights
+                                    .0
+                                    .iter_mut()
+                                    .zip(weights.iter().copied())
+                                    .for_each(|(out, w)| *out = alpha * w);
+                            }
+                        }
+                        LinearConstraint::TensorProduct {
+                            range_start,
+                            log_range_len,
+                            row_weights,
+                            col_weights,
+                        } => {
+                            let range_len = 1usize << log_range_len;
+                            let row_len = col_weights.num_evals();
+                            let acc_slice = &mut acc_weights.0
+                                [*range_start..*range_start + range_len];
+                            acc_slice
+                                .par_chunks_mut(row_len)
+                                .zip_eq(row_weights.0.par_iter().copied())
+                                .for_each(|(row_out, row_w)| {
+                                    let scale = alpha * row_w;
+                                    if initialized {
+                                        row_out
+                                            .iter_mut()
+                                            .zip(col_weights.0.iter().copied())
+                                            .for_each(|(out, w)| *out += scale * w);
+                                    } else {
+                                        row_out
+                                            .iter_mut()
+                                            .zip(col_weights.0.iter().copied())
+                                            .for_each(|(out, w)| *out = scale * w);
+                                    }
+                                });
+                        }
                     }
                     *acc_sum += alpha * expected;
+                    initialized = true;
                 });
         }
     }
@@ -506,6 +602,8 @@ impl<F: Field> EqStatement<F> {
                         });
                 });
 
+            let pack_width = Base::Packing::WIDTH;
+            let mut scratch = vec![F::ZERO; pack_width];
             self.linear_weights
                 .iter()
                 .zip(self.linear_evaluations.iter())
@@ -513,18 +611,56 @@ impl<F: Field> EqStatement<F> {
                 .for_each(|(j, (w, _expected))| {
                     let alpha = challenges[num_point_constraints + j];
                     let alpha_packed = F::ExtensionPacking::from(alpha);
-                    weights
-                        .0
-                        .iter_mut()
-                        .zip_eq(w.0.chunks(Base::Packing::WIDTH))
-                        .for_each(|(out, chunk)| {
-                            let packed = F::ExtensionPacking::from_ext_slice(chunk);
-                            if INITIALIZED || num_point_constraints > 0 || j > 0 {
-                                *out += alpha_packed * packed;
-                            } else {
-                                *out = alpha_packed * packed;
+                    match w {
+                        LinearConstraint::Dense(w) => {
+                            weights
+                                .0
+                                .iter_mut()
+                                .zip_eq(w.0.chunks(pack_width))
+                                .for_each(|(out, chunk)| {
+                                    let packed = F::ExtensionPacking::from_ext_slice(chunk);
+                                    if INITIALIZED || num_point_constraints > 0 || j > 0 {
+                                        *out += alpha_packed * packed;
+                                    } else {
+                                        *out = alpha_packed * packed;
+                                    }
+                                });
+                        }
+                        LinearConstraint::TensorProduct {
+                            range_start,
+                            log_range_len,
+                            row_weights,
+                            col_weights,
+                        } => {
+                            let range_len = 1usize << log_range_len;
+                            let row_len = col_weights.num_evals();
+                            let range_end = *range_start + range_len;
+                            let start_pack = range_start / pack_width;
+                            let end_pack = (range_end - 1) / pack_width;
+                            let log_row_len = log2_strict_usize(row_len);
+                            for pack_idx in start_pack..=end_pack {
+                                let base = pack_idx * pack_width;
+                                for i in 0..pack_width {
+                                    let idx = base + i;
+                                    if idx >= *range_start && idx < range_end {
+                                        let local = idx - range_start;
+                                        let row = local >> log_row_len;
+                                        let col = local & (row_len - 1);
+                                        scratch[i] = row_weights.0[row] * col_weights.0[col];
+                                    } else {
+                                        scratch[i] = F::ZERO;
+                                    }
+                                }
+                                let packed = F::ExtensionPacking::from_ext_slice(&scratch);
+                                let out = &mut weights.0[pack_idx];
+                                if INITIALIZED || num_point_constraints > 0 || j > 0 {
+                                    *out += alpha_packed * packed;
+                                } else {
+                                    *out = alpha_packed * packed;
+                                }
                             }
-                        });
+                        }
+                    }
                 });
 
             return;
@@ -561,21 +697,63 @@ impl<F: Field> EqStatement<F> {
         }
 
         if num_linear_constraints > 0 {
+            let mut initialized = INITIALIZED || num_point_constraints > 0;
+            let pack_width = Base::Packing::WIDTH;
+            let mut scratch = vec![F::ZERO; pack_width];
             self.linear_weights.iter().enumerate().for_each(|(j, w)| {
                 let alpha = challenges[num_point_constraints + j];
                 let alpha_packed = F::ExtensionPacking::from(alpha);
-                weights
-                    .0
-                    .iter_mut()
-                    .zip_eq(w.0.chunks(Base::Packing::WIDTH))
-                    .for_each(|(out, chunk)| {
-                        let packed = F::ExtensionPacking::from_ext_slice(chunk);
-                        if INITIALIZED || num_point_constraints > 0 || j > 0 {
-                            *out += alpha_packed * packed;
-                        } else {
-                            *out = alpha_packed * packed;
+                match w {
+                    LinearConstraint::Dense(w) => {
+                        weights
+                            .0
+                            .iter_mut()
+                            .zip_eq(w.0.chunks(pack_width))
+                            .for_each(|(out, chunk)| {
+                                let packed = F::ExtensionPacking::from_ext_slice(chunk);
+                                if initialized {
+                                    *out += alpha_packed * packed;
+                                } else {
+                                    *out = alpha_packed * packed;
+                                }
+                            });
+                    }
+                    LinearConstraint::TensorProduct {
+                        range_start,
+                        log_range_len,
+                        row_weights,
+                        col_weights,
+                    } => {
+                        let range_len = 1usize << log_range_len;
+                        let row_len = col_weights.num_evals();
+                        let range_end = *range_start + range_len;
+                        let start_pack = range_start / pack_width;
+                        let end_pack = (range_end - 1) / pack_width;
+                        let log_row_len = log2_strict_usize(row_len);
+                        for pack_idx in start_pack..=end_pack {
+                            let base = pack_idx * pack_width;
+                            for i in 0..pack_width {
+                                let idx = base + i;
+                                if idx >= *range_start && idx < range_end {
+                                    let local = idx - range_start;
+                                    let row = local >> log_row_len;
+                                    let col = local & (row_len - 1);
+                                    scratch[i] = row_weights.0[row] * col_weights.0[col];
+                                } else {
+                                    scratch[i] = F::ZERO;
+                                }
+                            }
+                            let packed = F::ExtensionPacking::from_ext_slice(&scratch);
+                            let out = &mut weights.0[pack_idx];
+                            if initialized {
+                                *out += alpha_packed * packed;
+                            } else {
+                                *out = alpha_packed * packed;
+                            }
                         }
-                    });
+                    }
+                }
+                initialized = true;
             });
         }
     }

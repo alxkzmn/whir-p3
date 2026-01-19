@@ -26,6 +26,8 @@ We extend the statement layer so that the protocol can batch and verify a mixtur
 
 1. Point constraints (existing): weights are derived as \(\mathrm{eq}(z_i, X)\)
 2. Explicit linear constraints (new): weights are provided directly as a vector over \(\{0,1\}^n\)
+3. **Structured linear constraints (tensor-product)**: a compact representation of a linear functional
+  that is a Kronecker product over a contiguous subrange of the concatenated polynomial
 
 Both kinds participate in the same “combine weights + combine claimed sums” flow, using the same batching challenge powers.
 
@@ -37,17 +39,20 @@ File: `src/whir/constraints/statement/eq.rs`
 
 `EqStatement<F>` now stores, in addition to `points`/`evaluations`:
 
-- `linear_weights: Vec<EvaluationsList<F>>`
+- `linear_weights: Vec<LinearConstraint<F>>`
 - `linear_evaluations: Vec<F>`
 
 Each entry corresponds to a constraint of the form \(\langle w_j, p(\cdot) \rangle = s_j\) where:
 
-- `w_j` is the full weight vector over \(\{0,1\}^{num_variables}\)
+- `w_j` is either:
+  - a dense weight vector over \(\{0,1\}^{num\_variables}\), or
+  - a **tensor-product** weight vector over a contiguous range in the concatenated polynomial.
 - `s_j` is the expected value
 
 ### New API
 
 - `add_linear_constraint(weights: EvaluationsList<F>, eval: F)`
+- `add_tensor_product_constraint(range_start, log_range_len, row_weights, col_weights, eval)`
 - `has_linear_constraints() -> bool`
 
 ### Ordering / batching invariant
@@ -89,9 +94,60 @@ We enforce this in two ways:
 
 See `UNIVARIATE_SKIP_AND_LINEAR_CONSTRAINTS.md` for a longer discussion and a mapping to the linked univariate-skip paper.
 
+## Tensor-product constraints for `EqRotateRight`
+
+The adapter now uses a tensor-product constraint for `MlQuery::EqRotateRight` instead of
+materializing a dense \(2^n\) vector.
+
+Let the concatenated polynomial range for a matrix be partitioned into rows of length
+\(2^{\log w}\) (where \(\log w\) is the matrix log-width). For `EqRotateRight`, the weights factor as:
+
+$$
+w(\text{row}, \text{col}) = w_\text{row}(\text{row}) \cdot w_\text{col}(\text{col})
+$$
+
+where:
+
+- \(w_\text{col}\) is the equality polynomial over the column variables (`eq_r`), and
+- \(w_\text{row}\) is the rotated equality polynomial from `EqRotateRight`.
+
+We store these two vectors separately and apply them only over the matrix’s contiguous range
+inside the concatenated polynomial. This preserves the same linear functional while avoiding
+construction of a full-length dense vector.
+
+### Why this matches the old semantics
+
+The old approach produced a dense vector `weight` where each row chunk had the same column
+weights (`eq_r`) scaled by the row’s rotated weight. The tensor-product representation encodes
+exactly that Kronecker structure, and the verifier evaluates it by:
+
+$$
+\langle w, p \rangle = \sum_{\text{row}} w_\text{row}(\text{row}) \cdot \sum_{\text{col}} w_\text{col}(\text{col})\, p(\text{row},\text{col})
+$$
+
+The concatenated polynomial’s **high bits** (selecting the range) are fixed by
+`range_start`, and the verifier multiplies by the corresponding equality factor for those bits.
+
+## Comparison with the old dense-vector approach
+
+**Old (dense):**
+
+- Build a length-\(2^{\log b}\) `weight` vector for every `EqRotateRight` query.
+- Cost: \(O(2^{\log b})\) memory traffic and time per query.
+- Verifier must evaluate a full multilinear polynomial defined by the dense vector.
+
+**New (tensor-product):**
+
+- Store only `row_weights` and `col_weights` plus range metadata.
+- Cost: \(O(2^{\log w} + 2^{\log h})\) storage (row/col) and no dense materialization.
+- Verifier evaluates a product of two smaller multilinear polynomials and a fixed-range factor.
+
+This preserves correctness while drastically reducing verifier work for `EqRotateRight`.
+
 ## Integration note (outside `whir-p3`)
 
-The `p3-whir` adapter translates `MlQuery::EqRotateRight` into an explicit weight vector over the concatenated polynomial’s hypercube and passes it into `EqStatement::add_linear_constraint`.
+The `p3-whir` adapter translates `MlQuery::EqRotateRight` into a tensor-product constraint and
+passes it into `EqStatement::add_tensor_product_constraint`.
 
 This is intentionally kept in the adapter:
 
