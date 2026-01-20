@@ -1,14 +1,119 @@
 use alloc::{vec, vec::Vec};
 
 use p3_field::{ExtensionField, Field, TwoAdicField};
+use p3_interpolation::interpolate_subgroup;
+use p3_matrix::dense::RowMajorMatrix;
 use p3_util::log2_strict_usize;
 
 use crate::{
     constant::K_SKIP_SUMCHECK,
     parameters::FoldingFactor,
+    poly::evals::EvaluationsList,
     poly::multilinear::MultilinearPoint,
     whir::constraints::{Constraint, statement::eq::LinearConstraint},
 };
+
+fn eval_evals_with_skip<EF>(
+    evals: &EvaluationsList<EF>,
+    r_all: &MultilinearPoint<EF>,
+    k_skip: usize,
+) -> EF
+where
+    EF: TwoAdicField,
+{
+    let n = r_all.num_variables() + k_skip - 1;
+    assert_eq!(
+        evals.num_variables(),
+        n,
+        "Evaluation list must match full domain size for skip evaluation"
+    );
+
+    let num_remaining_vars = n - k_skip;
+    let width = 1 << num_remaining_vars;
+    let mat = RowMajorMatrix::new(evals.as_slice().to_vec(), width);
+
+    let r_skip = *r_all
+        .last_variable()
+        .expect("skip challenge must be present");
+    let r_rest = MultilinearPoint::new(r_all.as_slice()[..num_remaining_vars].to_vec());
+
+    let folded_row = interpolate_subgroup(&mat, r_skip);
+    EvaluationsList::new(folded_row).evaluate_hypercube_base(&r_rest)
+}
+
+fn eq_d<EF: TwoAdicField>(x: EF, y: EF, subgroup_size: usize) -> EF {
+    let order = EF::from_usize(subgroup_size);
+    let order_inv = order
+        .try_inverse()
+        .expect("subgroup size must be invertible in the field");
+    let y_inv = y.inverse();
+    let base = x * y_inv;
+
+    let mut total_sum = EF::ZERO;
+    let mut power = EF::ONE;
+    for _ in 0..subgroup_size {
+        total_sum += power;
+        power *= base;
+    }
+
+    total_sum * order_inv
+}
+
+fn lagrange_weights_for_skip<EF: TwoAdicField>(k_skip: usize, r_skip: EF) -> Vec<EF> {
+    let subgroup_size = 1usize << k_skip;
+    let subgroup_gen = EF::two_adic_generator(k_skip);
+
+    let mut weights = vec![EF::ZERO; subgroup_size];
+    let mut x = EF::ONE;
+    for i in 0..subgroup_size {
+        let bit_rev_i = i.reverse_bits() >> (usize::BITS - k_skip as u32);
+        weights[bit_rev_i] = eq_d(x, r_skip, subgroup_size);
+        x *= subgroup_gen;
+    }
+
+    weights
+}
+
+fn eval_tensor_product_with_skip<EF: TwoAdicField + Field>(
+    range_start: usize,
+    log_range_len: usize,
+    row_weights: &EvaluationsList<EF>,
+    col_weights: &EvaluationsList<EF>,
+    eval_point: &MultilinearPoint<EF>,
+    k_skip: usize,
+    num_variables: usize,
+) -> EF {
+    let range_len = 1usize << log_range_len;
+    let row_len = col_weights.num_evals();
+    let log_row_len = log2_strict_usize(row_len);
+    let rows = row_weights.num_evals();
+    debug_assert_eq!(row_len * rows, range_len);
+
+    let num_remaining_vars = num_variables - k_skip;
+    let width = 1usize << num_remaining_vars;
+
+    let r_skip = *eval_point
+        .last_variable()
+        .expect("skip challenge must be present");
+    let r_rest = MultilinearPoint::new(eval_point.as_slice()[..num_remaining_vars].to_vec());
+
+    let row_lagrange = lagrange_weights_for_skip(k_skip, r_skip);
+    let col_eq = EvaluationsList::new_from_point(r_rest.as_slice(), EF::ONE);
+
+    let mut total = EF::ZERO;
+    let range_end = range_start + range_len;
+    for idx in range_start..range_end {
+        let row = idx / width;
+        let col = idx % width;
+        let local = idx - range_start;
+        let row_local = local >> log_row_len;
+        let col_local = local & (row_len - 1);
+        let weight = row_weights.0[row_local] * col_weights.0[col_local];
+        total += weight * row_lagrange[row] * col_eq.0[col];
+    }
+
+    total
+}
 
 /// Evaluate a single round's constraint.
 fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
@@ -17,16 +122,17 @@ fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
     original_point: &MultilinearPoint<EF>,
     context: &PointContext<EF>,
 ) -> EF {
-    let (eval_point, use_skip_eval) = match (round, context) {
+    let (eval_point, use_skip_eval, k_skip) = match (round, context) {
         // Round 0 with skip: use full rotated point with skip evaluation
-        (0, PointContext::Skip { rotated, .. }) => (rotated.clone(), true),
+        (0, PointContext::Skip { rotated, k_skip, .. }) => (rotated.clone(), true, *k_skip),
         // Round 0 without skip: reverse full point
-        (0, PointContext::NonSkip) => (original_point.reversed(), false),
+        (0, PointContext::NonSkip) => (original_point.reversed(), false, 0),
         // Round >0 with skip: slice from this round's offset to end
         (
             i,
             PointContext::Skip {
                 rotated,
+                k_skip,
                 prover_challenge_offsets,
             },
         ) => {
@@ -39,12 +145,13 @@ fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
             (
                 challenges.get_subpoint_over_range(start..challenges.num_variables()),
                 false,
+                *k_skip,
             )
         }
         // Round >0 without skip: take first num_vars and reverse
         (_, PointContext::NonSkip) => {
             let slice = original_point.get_subpoint_over_range(0..constraint.num_variables());
-            (slice.reversed(), false)
+            (slice.reversed(), false, 0)
         }
     };
 
@@ -61,17 +168,6 @@ fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
         })
         .sum::<EF>();
 
-    // Explicit linear constraints contribute their weight-polynomial evaluations.
-    // These are weighted by the same challenge powers as equality constraints, continuing
-    // immediately after the point-evaluation constraints.
-    //
-    // NOTE: The univariate-skip path (use_skip_eval) is not compatible with generic linear
-    // functionals in the current protocol; those constraints should not be present there.
-    if use_skip_eval {
-        debug_assert!(constraint.eq_statement.linear_weights.is_empty());
-        debug_assert!(constraint.eq_statement.linear_evaluations.is_empty());
-    }
-
     let linear_eq_contribution = if constraint.eq_statement.linear_weights.is_empty() {
         EF::ZERO
     } else {
@@ -81,38 +177,66 @@ fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
             .linear_weights
             .iter()
             .zip(constraint.challenge.powers().skip(point_eq_count))
-            .map(|(weights, coeff)| match weights {
-                LinearConstraint::Dense(weights) => {
-                    weights.evaluate_hypercube_ext::<F>(&eval_point) * coeff
-                }
-                LinearConstraint::TensorProduct {
-                    range_start,
-                    log_range_len,
-                    row_weights,
-                    col_weights,
-                } => {
-                    let num_vars = constraint.eq_statement.num_variables();
-                    let row_len = col_weights.num_evals();
-                    let log_row_len = log2_strict_usize(row_len);
-                    let log_rows = *log_range_len - log_row_len;
-                    let high_bits = num_vars - *log_range_len;
-                    let point_slice = eval_point.as_slice();
-                    let (high_slice, rest) = point_slice.split_at(high_bits);
-                    let (row_slice, col_slice) = rest.split_at(log_rows);
+            .map(|(weights, coeff)| {
+                if use_skip_eval {
+                    match weights {
+                        LinearConstraint::Dense(weights) => {
+                            eval_evals_with_skip(weights, &eval_point, k_skip) * coeff
+                        }
+                        LinearConstraint::TensorProduct {
+                            range_start,
+                            log_range_len,
+                            row_weights,
+                            col_weights,
+                        } => {
+                            eval_tensor_product_with_skip(
+                                *range_start,
+                                *log_range_len,
+                                row_weights,
+                                col_weights,
+                                &eval_point,
+                                k_skip,
+                                constraint.num_variables(),
+                            ) * coeff
+                        }
+                    }
+                } else {
+                    match weights {
+                        LinearConstraint::Dense(weights) => {
+                            weights.evaluate_hypercube_ext::<F>(&eval_point) * coeff
+                        }
+                        LinearConstraint::TensorProduct {
+                            range_start,
+                            log_range_len,
+                            row_weights,
+                            col_weights,
+                        } => {
+                            let num_vars = constraint.eq_statement.num_variables();
+                            let row_len = col_weights.num_evals();
+                            let log_row_len = log2_strict_usize(row_len);
+                            let log_rows = *log_range_len - log_row_len;
+                            let high_bits = num_vars - *log_range_len;
+                            let point_slice = eval_point.as_slice();
+                            let (high_slice, rest) = point_slice.split_at(high_bits);
+                            let (row_slice, col_slice) = rest.split_at(log_rows);
 
-                    let mut fixed_bits = (*log_range_len..num_vars)
-                        .map(|i| EF::from_bool(((*range_start >> i) & 1) == 1))
-                        .collect::<Vec<_>>();
-                    fixed_bits.reverse();
-                    let fixed_eq = MultilinearPoint::new(fixed_bits)
-                        .eq_poly(&MultilinearPoint::new(high_slice.to_vec()));
+                            let mut fixed_bits = (*log_range_len..num_vars)
+                                .map(|i| EF::from_bool(((*range_start >> i) & 1) == 1))
+                                .collect::<Vec<_>>();
+                            fixed_bits.reverse();
+                            let fixed_eq = MultilinearPoint::new(fixed_bits)
+                                .eq_poly(&MultilinearPoint::new(high_slice.to_vec()));
 
-                    let row_eval = row_weights
-                        .evaluate_hypercube_ext::<F>(&MultilinearPoint::new(row_slice.to_vec()));
-                    let col_eval = col_weights
-                        .evaluate_hypercube_ext::<F>(&MultilinearPoint::new(col_slice.to_vec()));
+                            let row_eval = row_weights.evaluate_hypercube_ext::<F>(
+                                &MultilinearPoint::new(row_slice.to_vec()),
+                            );
+                            let col_eval = col_weights.evaluate_hypercube_ext::<F>(
+                                &MultilinearPoint::new(col_slice.to_vec()),
+                            );
 
-                    fixed_eq * row_eval * col_eval * coeff
+                            fixed_eq * row_eval * col_eval * coeff
+                        }
+                    }
                 }
             })
             .sum::<EF>()
@@ -199,9 +323,14 @@ impl ConstraintPolyEvaluator {
             offsets.push(offsets[round] + self.folding_factor.at_round(round + 1));
         }
 
+        let k_skip = self
+            .univariate_skip
+            .expect("univariate skip must be configured for skip context");
+
         PointContext::Skip {
             rotated,
             prover_challenge_offsets: offsets,
+            k_skip,
         }
     }
 }
@@ -214,6 +343,7 @@ enum PointContext<EF> {
     Skip {
         rotated: MultilinearPoint<EF>,
         prover_challenge_offsets: Vec<usize>,
+        k_skip: usize,
     },
 }
 

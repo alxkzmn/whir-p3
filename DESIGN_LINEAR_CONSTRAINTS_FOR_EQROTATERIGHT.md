@@ -83,14 +83,9 @@ This closes the soundness gap that would otherwise appear as an immediate sumche
 
 ## Interaction with univariate skip / SVO
 
-There is an important limitation: the current univariate-skip optimized initial phase assumes the statement can be expressed in the “pointwise” style.
-
-- Explicit linear functionals are currently **not** supported in the skip path.
-
-We enforce this in two ways:
-
-1. The adapter layer (`p3-whir`, outside this crate) forces classic `WithStatement` if it detects any linear constraints.
-2. The constraint system validation for the skip case rejects linear constraints.
+The current implementation supports linear constraints in skip mode by evaluating them with the
+same skip-aware mapping as the prover (with a dense expansion for tensor-product constraints in
+the skip round). This is correct but can be expensive for large instances.
 
 See `UNIVARIATE_SKIP_AND_LINEAR_CONSTRAINTS.md` for a longer discussion and a mapping to the linked univariate-skip paper.
 
