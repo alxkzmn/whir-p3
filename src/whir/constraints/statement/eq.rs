@@ -1575,7 +1575,7 @@ mod tests {
     #[test]
     fn test_packed_and_unpacked_match_with_linear_constraints() {
         // This test guards against divergences between the packed and unpacked batching paths.
-        // It specifically includes explicit linear constraints (used by EqRotateRight).
+        // It specifically includes explicit linear constraints.
         type Base = F;
 
         // Ensure k is large enough to exercise the packed path.
