@@ -11,8 +11,7 @@ skip-mode work with linear constraints.
 ### Relation to the linked paper
 
 The “univariate skip” idea used here corresponds closely to Section **5.1 (The Univariate Skip)**
-of _“Some Improvements for the PIOP for ZeroCheck”_ (Angus Gruen, Polygon Zero)
-(see the file `univariate skip paper.md` in this repository).
+of [_“Some Improvements for the PIOP for ZeroCheck”_](https://eprint.iacr.org/2024/108).
 
 In the paper’s terminology, the prover replaces the first `k` Boolean variables with a multiplicative
 subgroup domain `D` of size $|D| = 2^k$, effectively working over a product domain
