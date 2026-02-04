@@ -516,8 +516,8 @@ impl<F: Field> EqStatement<F> {
                         } => {
                             let range_len = 1usize << log_range_len;
                             let row_len = col_weights.num_evals();
-                            let acc_slice = &mut acc_weights.0
-                                [*range_start..*range_start + range_len];
+                            let acc_slice =
+                                &mut acc_weights.0[*range_start..*range_start + range_len];
                             acc_slice
                                 .par_chunks_mut(row_len)
                                 .zip_eq(row_weights.0.par_iter().copied())

@@ -8,8 +8,7 @@ use p3_util::log2_strict_usize;
 use crate::{
     constant::K_SKIP_SUMCHECK,
     parameters::FoldingFactor,
-    poly::evals::EvaluationsList,
-    poly::multilinear::MultilinearPoint,
+    poly::{evals::EvaluationsList, multilinear::MultilinearPoint},
     whir::constraints::{Constraint, statement::eq::LinearConstraint},
 };
 
@@ -124,7 +123,12 @@ fn eval_round<F: Field, EF: ExtensionField<F> + TwoAdicField>(
 ) -> EF {
     let (eval_point, use_skip_eval, k_skip) = match (round, context) {
         // Round 0 with skip: use full rotated point with skip evaluation
-        (0, PointContext::Skip { rotated, k_skip, .. }) => (rotated.clone(), true, *k_skip),
+        (
+            0,
+            PointContext::Skip {
+                rotated, k_skip, ..
+            },
+        ) => (rotated.clone(), true, *k_skip),
         // Round 0 without skip: reverse full point
         (0, PointContext::NonSkip) => (original_point.reversed(), false, 0),
         // Round >0 with skip: slice from this round's offset to end

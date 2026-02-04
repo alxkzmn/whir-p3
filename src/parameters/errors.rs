@@ -1,10 +1,10 @@
 use alloc::{format, string::String};
 use core::{f64::consts::LOG2_10, fmt::Display, str::FromStr};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Security assumptions determines which proximity parameters and conjectures are assumed by the error computation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecurityAssumption {
     /// Unique decoding assumes that the distance of each oracle is within the UDR of the code.
     /// We refer to this configuration as UD for short.

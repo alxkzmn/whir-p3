@@ -1,6 +1,7 @@
 use core::fmt::Display;
 
 use errors::SecurityAssumption;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::whir::parameters::InitialPhaseConfig;
@@ -29,7 +30,7 @@ pub enum FoldingFactorError {
 }
 
 /// Defines the folding factor for polynomial commitments.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum FoldingFactor {
     /// A fixed folding factor used in all rounds.
     Constant(usize),
