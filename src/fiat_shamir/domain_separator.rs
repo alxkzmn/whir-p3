@@ -3,6 +3,7 @@ use core::marker::PhantomData;
 
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{ExtensionField, Field, TwoAdicField};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     constant::K_SKIP_SUMCHECK,
@@ -34,7 +35,8 @@ pub struct SumcheckParams {
 }
 
 /// The pattern of an interactive protocol.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "F: Serialize", deserialize = "F: Deserialize<'de>"))]
 pub struct DomainSeparator<EF, F> {
     /// The internal pattern finite field representation.
     pattern: Vec<F>,

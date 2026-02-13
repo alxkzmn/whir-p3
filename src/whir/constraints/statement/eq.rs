@@ -1,4 +1,6 @@
-use alloc::vec::Vec;
+#[cfg(test)]
+use alloc::format;
+use alloc::{vec, vec::Vec};
 
 use itertools::Itertools;
 use p3_field::{
@@ -98,6 +100,79 @@ fn packed_batch_eqs<F: Field, EF: ExtensionField<F>>(
 /// - `points.len() == evaluations.len()`.
 /// - Every `MultilinearPoint` in `points` has exactly `num_variables` coordinates.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinearConstraint<F> {
+    /// A dense weight vector over the full `2^num_variables`-sized Boolean hypercube.
+    Dense(EvaluationsList<F>),
+
+    /// A tensor-product (Kronecker) constraint over a contiguous, aligned block of
+    /// the concatenated evaluation vector.
+    ///
+    /// # Validity requirements
+    ///
+    /// A weight matrix can be represented as a `TensorProduct` **only when** both of the
+    /// following hold:
+    ///
+    /// 1. The non-zero weights occupy a contiguous power-of-two block
+    ///    `[range_start, range_start + 2^log_range_len)` of the evaluation vector,
+    ///    with `range_start` aligned to `2^log_range_len`.
+    ///
+    /// 2. The weight at position `(row, col)` within the block satisfies:
+    ///    ```text
+    ///    w[row, col] = row_weights[row] * col_weights[col]
+    ///    ```
+    ///    i.e. the weight matrix is a rank-1 outer product (Kronecker product) of
+    ///    `row_weights` and `col_weights`.
+    ///
+    /// ## Valid example
+    ///
+    /// A 2×4 block with `row_weights = [2, 5]` and `col_weights = [3, 7, 0, 0]`:
+    ///
+    /// ```text
+    /// row 0: [ 2*3, 2*7, 2*0, 2*0 ] = [ 6, 14,  0,  0 ]
+    /// row 1: [ 5*3, 5*7, 5*0, 5*0 ] = [ 15, 35, 0,  0 ]
+    /// ```
+    ///
+    /// Flattened: `[6, 14, 0, 0, 15, 35, 0, 0]`.
+    ///
+    /// More generally, any weight matrix like:
+    ///
+    /// ```text
+    /// row_weights = [2, 5], col_weights = [3, 7, 11]
+    /// row 0: [ 6, 14, 22 ]
+    /// row 1: [ 15, 35, 55 ]
+    /// ```
+    ///
+    /// is a valid tensor product (though both dimensions must be powers of two in this
+    /// implementation because `EvaluationsList` requires power-of-two lengths).
+    ///
+    /// ## Invalid example
+    ///
+    /// The 2×2 identity matrix `[[1, 0], [0, 1]]` **cannot** be expressed as a tensor product.
+    /// If it could, there would exist `row_weights = [r0, r1]` and `col_weights = [c0, c1]`
+    /// such that:
+    ///
+    /// ```text
+    /// r0*c0 = 1  =>  r0 ≠ 0, c0 ≠ 0
+    /// r0*c1 = 0  =>  c1 = 0   (since r0 ≠ 0)
+    /// r1*c1 = 1  =>  0 = 1    (contradiction)
+    /// ```
+    ///
+    /// Any weight matrix of rank > 1 fails this decomposition.
+    TensorProduct {
+        /// Starting index of the non-zero block in the concatenated evaluation vector.
+        /// Must be aligned: `range_start % (1 << log_range_len) == 0`.
+        range_start: usize,
+        /// Log₂ of the block length. The block spans `2^log_range_len` entries,
+        /// equal to `row_weights.num_evals() * col_weights.num_evals()`.
+        log_range_len: usize,
+        /// Weight vector over the "row" dimension of the block.
+        row_weights: EvaluationsList<F>,
+        /// Weight vector over the "column" dimension of the block.
+        col_weights: EvaluationsList<F>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EqStatement<F> {
     /// Number of variables in the multilinear polynomial space.
     num_variables: usize,
@@ -105,6 +180,15 @@ pub struct EqStatement<F> {
     pub(crate) points: Vec<MultilinearPoint<F>>,
     /// List of target evaluations.
     pub(crate) evaluations: Vec<F>,
+
+    /// Explicit linear constraints of the form: <weights, poly_evals> = eval.
+    ///
+    /// Each entry stores the full weight vector over the Boolean hypercube `{0,1}^num_variables`.
+    /// This is used for constraints that cannot be expressed as a point evaluation (e.g. rotated
+    /// evaluation vectors / other linear functionals).
+    pub(crate) linear_weights: Vec<LinearConstraint<F>>,
+    /// Expected evaluations corresponding to `linear_weights`.
+    pub(crate) linear_evaluations: Vec<F>,
 }
 
 impl<F: Field> EqStatement<F> {
@@ -115,6 +199,8 @@ impl<F: Field> EqStatement<F> {
             num_variables,
             points: Vec::new(),
             evaluations: Vec::new(),
+            linear_weights: Vec::new(),
+            linear_evaluations: Vec::new(),
         }
     }
 
@@ -149,6 +235,8 @@ impl<F: Field> EqStatement<F> {
             num_variables,
             points,
             evaluations,
+            linear_weights: Vec::new(),
+            linear_evaluations: Vec::new(),
         }
     }
 
@@ -222,6 +310,8 @@ impl<F: Field> EqStatement<F> {
             num_variables,
             points,
             evaluations,
+            linear_weights: Vec::new(),
+            linear_evaluations: Vec::new(),
         }
     }
 
@@ -235,7 +325,8 @@ impl<F: Field> EqStatement<F> {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         debug_assert!(self.points.is_empty() == self.evaluations.is_empty());
-        self.points.is_empty()
+        debug_assert!(self.linear_weights.is_empty() == self.linear_evaluations.is_empty());
+        self.points.is_empty() && self.linear_weights.is_empty()
     }
 
     /// Returns an iterator over the evaluation constraints in the statement.
@@ -247,14 +338,59 @@ impl<F: Field> EqStatement<F> {
     #[must_use]
     pub const fn len(&self) -> usize {
         debug_assert!(self.points.len() == self.evaluations.len());
-        self.points.len()
+        debug_assert!(self.linear_weights.len() == self.linear_evaluations.len());
+        self.points.len() + self.linear_weights.len()
+    }
+
+    /// Returns true if this statement contains any explicit linear constraints.
+    ///
+    /// These constraints are not point evaluations and may not be compatible with
+    /// sumcheck optimizations that assume equality polynomials only.
+    #[must_use]
+    pub const fn has_linear_constraints(&self) -> bool {
+        !self.linear_weights.is_empty()
     }
 
     /// Verifies that a given polynomial satisfies all constraints in the statement.
     #[must_use]
     pub fn verify(&self, poly: &EvaluationsList<F>) -> bool {
-        self.iter()
-            .all(|(point, &expected_eval)| poly.evaluate_hypercube_base(point) == expected_eval)
+        let points_ok = self
+            .iter()
+            .all(|(point, &expected_eval)| poly.evaluate_hypercube_base(point) == expected_eval);
+        let linear_ok = self
+            .linear_weights
+            .iter()
+            .zip(self.linear_evaluations.iter())
+            .all(|(weights, &expected)| match weights {
+                LinearConstraint::Dense(weights) => {
+                    debug_assert_eq!(weights.num_variables(), self.num_variables());
+                    dot_product::<F, _, _>(poly.iter().copied(), weights.iter().copied())
+                        == expected
+                }
+                LinearConstraint::TensorProduct {
+                    range_start,
+                    log_range_len,
+                    row_weights,
+                    col_weights,
+                } => {
+                    let range_len = 1usize << log_range_len;
+                    let row_len = col_weights.num_evals();
+                    let rows = row_weights.num_evals();
+                    debug_assert_eq!(row_len * rows, range_len);
+                    let mut total = F::ZERO;
+                    poly.as_slice()[*range_start..*range_start + range_len]
+                        .chunks(row_len)
+                        .zip(row_weights.0.iter().copied())
+                        .for_each(|(poly_row, row_w)| {
+                            total += dot_product::<F, _, _>(
+                                poly_row.iter().copied(),
+                                col_weights.0.iter().copied(),
+                            ) * row_w;
+                        });
+                    total == expected
+                }
+            });
+        points_ok && linear_ok
     }
 
     /// Concatenates another statement's constraints into this one.
@@ -262,6 +398,10 @@ impl<F: Field> EqStatement<F> {
         assert_eq!(self.num_variables, other.num_variables);
         self.points.extend_from_slice(&other.points);
         self.evaluations.extend_from_slice(&other.evaluations);
+
+        self.linear_weights.extend_from_slice(&other.linear_weights);
+        self.linear_evaluations
+            .extend_from_slice(&other.linear_evaluations);
     }
 
     /// Adds an evaluation constraint `p(z) = s` to the system.
@@ -302,6 +442,56 @@ impl<F: Field> EqStatement<F> {
         self.evaluations.push(eval);
     }
 
+    /// Adds an explicit linear constraint of the form `<weights, poly_evals> = eval`.
+    ///
+    /// `weights` must contain `2^num_variables` evaluations over the Boolean hypercube.
+    pub fn add_linear_constraint(&mut self, weights: EvaluationsList<F>, eval: F) {
+        assert_eq!(weights.num_variables(), self.num_variables());
+        self.linear_weights.push(LinearConstraint::Dense(weights));
+        self.linear_evaluations.push(eval);
+    }
+
+    /// Adds an explicit linear constraint with tensor-product (Kronecker) structure over a
+    /// contiguous, aligned range of the evaluation vector.
+    ///
+    /// The effective weight vector is zero outside
+    /// `[range_start, range_start + 2^log_range_len)`. Inside the range, the weight at
+    /// position `(row, col)` is `row_weights[row] * col_weights[col]` in row-major order.
+    ///
+    /// See [`LinearConstraint::TensorProduct`] for a detailed explanation of when a weight
+    /// matrix admits this decomposition (it must be a rank-1 outer product).
+    ///
+    /// # Panics
+    ///
+    /// - If `row_weights.num_evals() * col_weights.num_evals() != 2^log_range_len`.
+    /// - If `range_start` is not aligned to `2^log_range_len`.
+    ///
+    /// # Caller responsibility
+    ///
+    /// The caller must ensure that the weight matrix truly has Kronecker structure.
+    /// This method trusts the provided decomposition and does **not** verify it at runtime.
+    pub fn add_tensor_product_constraint(
+        &mut self,
+        range_start: usize,
+        log_range_len: usize,
+        row_weights: EvaluationsList<F>,
+        col_weights: EvaluationsList<F>,
+        eval: F,
+    ) {
+        let range_len = 1usize << log_range_len;
+        let row_len = col_weights.num_evals();
+        let rows = row_weights.num_evals();
+        assert_eq!(row_len * rows, range_len);
+        assert_eq!(range_start % range_len, 0);
+        self.linear_weights.push(LinearConstraint::TensorProduct {
+            range_start,
+            log_range_len,
+            row_weights,
+            col_weights,
+        });
+        self.linear_evaluations.push(eval);
+    }
+
     /// Inserts multiple constraints at the front of the system.
     ///
     /// Panics if any constraint's number of variables does not match the system.
@@ -325,47 +515,111 @@ impl<F: Field> EqStatement<F> {
         // If there are no constraints, the combination is:
         // - The combined polynomial W(X) is identically zero (all evaluations = 0).
         // - The combined expected sum S is zero.
-        if self.points.is_empty() {
+        if self.is_empty() {
             return;
         }
 
-        let num_constraints = self.len();
+        let num_point_constraints = self.points.len();
+        let num_linear_constraints = self.linear_weights.len();
+        let num_constraints = num_point_constraints + num_linear_constraints;
         let num_variables = self.num_variables();
 
         // Precompute challenge powers γ^i for i = 0..num_constraints-1.
         let challenges = challenge.powers().collect_n(num_constraints);
 
-        // Create a matrix where each column is one evaluation point.
-        //
-        // Matrix layout:
-        // - rows are variables,
-        // - columns are evaluation points.
-        let points_data = F::zero_vec(num_variables * num_constraints);
-        let mut points_matrix = RowMajorMatrix::new(points_data, num_constraints);
+        if num_point_constraints > 0 {
+            // Create a matrix where each column is one evaluation point.
+            //
+            // Matrix layout:
+            // - rows are variables,
+            // - columns are evaluation points.
+            let points_data = F::zero_vec(num_variables * num_point_constraints);
+            let mut points_matrix = RowMajorMatrix::new(points_data, num_point_constraints);
 
-        // Parallelize the transpose operation over rows (variables).
-        //
-        // Each thread writes to its own contiguous row, which is cache-friendly.
-        points_matrix
-            .rows_mut()
-            .enumerate()
-            .for_each(|(var_idx, row_slice)| {
-                for (col_idx, point) in self.points.iter().enumerate() {
-                    row_slice[col_idx] = point[var_idx];
-                }
-            });
+            // Parallelize the transpose operation over rows (variables).
+            //
+            // Each thread writes to its own contiguous row, which is cache-friendly.
+            points_matrix
+                .rows_mut()
+                .enumerate()
+                .for_each(|(var_idx, row_slice)| {
+                    for (col_idx, point) in self.points.iter().enumerate() {
+                        row_slice[col_idx] = point[var_idx];
+                    }
+                });
 
-        // Compute the batched equality polynomial evaluations.
-        // This computes W(x) = ∑_i γ^i * eq(x, z_i) for all x ∈ {0,1}^k.
-        eval_eq_batch::<Base, F, INITIALIZED>(
-            points_matrix.as_view(),
-            &mut acc_weights.0,
-            &challenges,
-        );
+            // Compute the batched equality polynomial evaluations.
+            // This computes: ∑_i γ^i * eq(x, z_i)
+            eval_eq_batch::<Base, F, INITIALIZED>(
+                points_matrix.as_view(),
+                &mut acc_weights.0,
+                &challenges[..num_point_constraints],
+            );
 
-        // Combine expected evaluations: S = ∑_i γ^i * s_i
-        *acc_sum +=
-            dot_product::<F, _, _>(self.evaluations.iter().copied(), challenges.into_iter());
+            // Combine expected evaluations for point constraints.
+            *acc_sum += dot_product::<F, _, _>(
+                self.evaluations.iter().copied(),
+                challenges[..num_point_constraints].iter().copied(),
+            );
+        }
+
+        if num_linear_constraints > 0 {
+            let mut initialized = INITIALIZED || num_point_constraints > 0;
+            self.linear_weights
+                .iter()
+                .zip(self.linear_evaluations.iter())
+                .enumerate()
+                .for_each(|(j, (weights, &expected))| {
+                    let alpha = challenges[num_point_constraints + j];
+                    match weights {
+                        LinearConstraint::Dense(weights) => {
+                            if initialized {
+                                acc_weights
+                                    .0
+                                    .iter_mut()
+                                    .zip(weights.iter().copied())
+                                    .for_each(|(out, w)| *out += alpha * w);
+                            } else {
+                                acc_weights
+                                    .0
+                                    .iter_mut()
+                                    .zip(weights.iter().copied())
+                                    .for_each(|(out, w)| *out = alpha * w);
+                            }
+                        }
+                        LinearConstraint::TensorProduct {
+                            range_start,
+                            log_range_len,
+                            row_weights,
+                            col_weights,
+                        } => {
+                            let range_len = 1usize << log_range_len;
+                            let row_len = col_weights.num_evals();
+                            let acc_slice =
+                                &mut acc_weights.0[*range_start..*range_start + range_len];
+                            acc_slice
+                                .par_chunks_mut(row_len)
+                                .zip_eq(row_weights.0.par_iter().copied())
+                                .for_each(|(row_out, row_w)| {
+                                    let scale = alpha * row_w;
+                                    if initialized {
+                                        row_out
+                                            .iter_mut()
+                                            .zip(col_weights.0.iter().copied())
+                                            .for_each(|(out, w)| *out += scale * w);
+                                    } else {
+                                        row_out
+                                            .iter_mut()
+                                            .zip(col_weights.0.iter().copied())
+                                            .for_each(|(out, w)| *out = scale * w);
+                                    }
+                                });
+                        }
+                    }
+                    *acc_sum += alpha * expected;
+                    initialized = true;
+                });
+        }
     }
 
     /// Inserts multiple constraints at the front of the system.
@@ -388,9 +642,14 @@ impl<F: Field> EqStatement<F> {
         Base: Field,
         F: ExtensionField<Base>,
     {
-        if self.points.is_empty() {
+        if self.is_empty() {
             return;
         }
+
+        let num_point_constraints = self.points.len();
+        let num_linear_constraints = self.linear_weights.len();
+        let num_constraints = num_point_constraints + num_linear_constraints;
+        let challenges = challenge.powers().collect_n(num_constraints);
 
         let k = self.num_variables();
         let k_pack = log2_strict_usize(Base::Packing::WIDTH);
@@ -404,10 +663,10 @@ impl<F: Field> EqStatement<F> {
         if k_pack * 2 > k {
             self.points
                 .iter()
-                .zip(challenge.powers())
+                .zip(challenges.iter().copied())
                 .enumerate()
-                .for_each(|(i, (point, challenge))| {
-                    let eq = EvaluationsList::new_from_point(point.as_slice(), challenge);
+                .for_each(|(i, (point, alpha))| {
+                    let eq = EvaluationsList::new_from_point(point.as_slice(), alpha);
                     weights
                         .0
                         .iter_mut()
@@ -421,28 +680,161 @@ impl<F: Field> EqStatement<F> {
                             }
                         });
                 });
+
+            let pack_width = Base::Packing::WIDTH;
+            let mut scratch = vec![F::ZERO; pack_width];
+            self.linear_weights
+                .iter()
+                .zip(self.linear_evaluations.iter())
+                .enumerate()
+                .for_each(|(j, (w, _expected))| {
+                    let alpha = challenges[num_point_constraints + j];
+                    let alpha_packed = F::ExtensionPacking::from(alpha);
+                    match w {
+                        LinearConstraint::Dense(w) => {
+                            weights
+                                .0
+                                .iter_mut()
+                                .zip_eq(w.0.chunks(pack_width))
+                                .for_each(|(out, chunk)| {
+                                    let packed = F::ExtensionPacking::from_ext_slice(chunk);
+                                    if INITIALIZED || num_point_constraints > 0 || j > 0 {
+                                        *out += alpha_packed * packed;
+                                    } else {
+                                        *out = alpha_packed * packed;
+                                    }
+                                });
+                        }
+                        LinearConstraint::TensorProduct {
+                            range_start,
+                            log_range_len,
+                            row_weights,
+                            col_weights,
+                        } => {
+                            let range_len = 1usize << log_range_len;
+                            let row_len = col_weights.num_evals();
+                            let range_end = *range_start + range_len;
+                            let start_pack = range_start / pack_width;
+                            let end_pack = (range_end - 1) / pack_width;
+                            let log_row_len = log2_strict_usize(row_len);
+                            for pack_idx in start_pack..=end_pack {
+                                let base = pack_idx * pack_width;
+                                for i in 0..pack_width {
+                                    let idx = base + i;
+                                    if idx >= *range_start && idx < range_end {
+                                        let local = idx - range_start;
+                                        let row = local >> log_row_len;
+                                        let col = local & (row_len - 1);
+                                        scratch[i] = row_weights.0[row] * col_weights.0[col];
+                                    } else {
+                                        scratch[i] = F::ZERO;
+                                    }
+                                }
+                                let packed = F::ExtensionPacking::from_ext_slice(&scratch);
+                                let out = &mut weights.0[pack_idx];
+                                if INITIALIZED || num_point_constraints > 0 || j > 0 {
+                                    *out += alpha_packed * packed;
+                                } else {
+                                    *out = alpha_packed * packed;
+                                }
+                            }
+                        }
+                    }
+                });
+
             return;
         }
 
-        let points = MultilinearPoint::transpose(&self.points, true);
-        let (left, right) = points.split_rows(k / 2);
-        let left = packed_batch_eqs::<Base, F>(left);
-        let right = batch_eqs::<Base, F>(right, challenge);
+        if num_point_constraints > 0 {
+            let points = MultilinearPoint::transpose(&self.points, true);
+            let (left, right) = points.split_rows(k / 2);
+            let left = packed_batch_eqs::<Base, F>(left);
+            let right = batch_eqs::<Base, F>(right, challenge);
 
-        weights
-            .0
-            .par_chunks_mut(left.height())
-            .zip_eq(right.par_row_slices())
-            .for_each(|(out, right)| {
-                out.iter_mut().zip(left.rows()).for_each(|(out, left)| {
-                    if INITIALIZED {
-                        *out +=
-                            dot_product::<F::ExtensionPacking, _, _>(left, right.iter().copied());
-                    } else {
-                        *out = dot_product(left, right.iter().copied());
-                    }
+            weights
+                .0
+                .par_chunks_mut(left.height())
+                .zip_eq(right.par_row_slices())
+                .for_each(|(out, right)| {
+                    out.iter_mut().zip(left.rows()).for_each(|(out, left)| {
+                        if INITIALIZED {
+                            *out += dot_product::<F::ExtensionPacking, _, _>(
+                                left,
+                                right.iter().copied(),
+                            );
+                        } else {
+                            *out = dot_product(left, right.iter().copied());
+                        }
+                    });
                 });
+        } else if !INITIALIZED {
+            // Ensure the accumulator is properly initialized to zero if this is the first writer.
+            weights
+                .0
+                .iter_mut()
+                .for_each(|w| *w = F::ExtensionPacking::ZERO);
+        }
+
+        if num_linear_constraints > 0 {
+            let mut initialized = INITIALIZED || num_point_constraints > 0;
+            let pack_width = Base::Packing::WIDTH;
+            let mut scratch = vec![F::ZERO; pack_width];
+            self.linear_weights.iter().enumerate().for_each(|(j, w)| {
+                let alpha = challenges[num_point_constraints + j];
+                let alpha_packed = F::ExtensionPacking::from(alpha);
+                match w {
+                    LinearConstraint::Dense(w) => {
+                        weights
+                            .0
+                            .iter_mut()
+                            .zip_eq(w.0.chunks(pack_width))
+                            .for_each(|(out, chunk)| {
+                                let packed = F::ExtensionPacking::from_ext_slice(chunk);
+                                if initialized {
+                                    *out += alpha_packed * packed;
+                                } else {
+                                    *out = alpha_packed * packed;
+                                }
+                            });
+                    }
+                    LinearConstraint::TensorProduct {
+                        range_start,
+                        log_range_len,
+                        row_weights,
+                        col_weights,
+                    } => {
+                        let range_len = 1usize << log_range_len;
+                        let row_len = col_weights.num_evals();
+                        let range_end = *range_start + range_len;
+                        let start_pack = range_start / pack_width;
+                        let end_pack = (range_end - 1) / pack_width;
+                        let log_row_len = log2_strict_usize(row_len);
+                        for pack_idx in start_pack..=end_pack {
+                            let base = pack_idx * pack_width;
+                            for i in 0..pack_width {
+                                let idx = base + i;
+                                if idx >= *range_start && idx < range_end {
+                                    let local = idx - range_start;
+                                    let row = local >> log_row_len;
+                                    let col = local & (row_len - 1);
+                                    scratch[i] = row_weights.0[row] * col_weights.0[col];
+                                } else {
+                                    scratch[i] = F::ZERO;
+                                }
+                            }
+                            let packed = F::ExtensionPacking::from_ext_slice(&scratch);
+                            let out = &mut weights.0[pack_idx];
+                            if initialized {
+                                *out += alpha_packed * packed;
+                            } else {
+                                *out = alpha_packed * packed;
+                            }
+                        }
+                    }
+                }
+                initialized = true;
             });
+        }
     }
 
     /// Combines a list of evals into a single linear combination using powers of `gamma`,
@@ -452,7 +844,14 @@ impl<F: Field> EqStatement<F> {
     /// - `claimed_eval`: Mutable reference to the total accumulated claimed eval so far. Updated in place.
     /// - `gamma`: A random extension field element used to weight the evals.
     pub fn combine_evals(&self, claimed_eval: &mut F, gamma: F) {
-        *claimed_eval += dot_product(self.evaluations.iter().copied(), gamma.powers());
+        let total = self.len();
+        *claimed_eval += dot_product::<F, _, _>(
+            self.evaluations
+                .iter()
+                .copied()
+                .chain(self.linear_evaluations.iter().copied()),
+            gamma.powers().take(total),
+        );
     }
 
     /// Computes the equality polynomial for a point over a multiplicative subgroup domain.
@@ -636,9 +1035,12 @@ mod tests {
     use alloc::vec;
 
     use p3_baby_bear::BabyBear;
-    use p3_field::{PrimeCharacteristicRing, extension::BinomialExtensionField};
+    use p3_field::{
+        ExtensionField, Field, PackedValue, PrimeCharacteristicRing,
+        extension::BinomialExtensionField,
+    };
     use proptest::prelude::*;
-    use rand::{SeedableRng, rngs::SmallRng};
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
 
     use super::*;
 
@@ -1247,5 +1649,455 @@ mod tests {
                 assert_eq!(sum0, sum1);
             }
         }
+    }
+
+    #[test]
+    fn test_packed_and_unpacked_match_with_linear_constraints() {
+        // This test guards against divergences between the packed and unpacked batching paths.
+        // It specifically includes explicit linear constraints.
+        type Base = F;
+
+        // Ensure k is large enough to exercise the packed path.
+        let k = 8;
+        let k_pack = log2_strict_usize(<Base as Field>::Packing::WIDTH);
+        assert!(k >= k_pack);
+
+        let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Add a couple of point constraints.
+        for _ in 0..2 {
+            let point = MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+            let eval = F::from_u64(rng.random::<u32>() as u64);
+            statement.add_evaluated_constraint(point, eval);
+        }
+
+        // Add a couple of explicit linear constraints.
+        for _ in 0..2 {
+            let weights = (0..(1 << k))
+                .map(|_| F::from_u64((rng.random::<u32>() % 97) as u64))
+                .collect::<Vec<_>>();
+            let eval = F::from_u64(rng.random::<u32>() as u64);
+            statement.add_linear_constraint(EvaluationsList::new(weights), eval);
+        }
+
+        let gamma = F::from_u64(7);
+
+        // Unpacked combination.
+        let mut weights_unpacked = EvaluationsList::zero(k);
+        let mut sum_unpacked = F::ZERO;
+        statement.combine_hypercube::<Base, false>(&mut weights_unpacked, &mut sum_unpacked, gamma);
+
+        // Packed combination (outputs 2^(k-k_pack) packed field elements).
+        let mut weights_packed =
+            EvaluationsList::<<F as ExtensionField<Base>>::ExtensionPacking>::zero(k - k_pack);
+        let mut sum_packed = F::ZERO;
+        statement.combine_hypercube_packed::<Base, false>(
+            &mut weights_packed,
+            &mut sum_packed,
+            gamma,
+        );
+
+        assert_eq!(sum_unpacked, sum_packed);
+
+        // Unpack and compare the full evaluation table.
+        let mut unpacked = Vec::with_capacity(1 << k);
+        for packed in &weights_packed.0 {
+            let slice: &[F] = PackedValue::as_slice(packed);
+            unpacked.extend_from_slice(slice);
+        }
+        unpacked.truncate(1 << k);
+
+        assert_eq!(unpacked, weights_unpacked.0);
+    }
+
+    #[test]
+    fn test_combined_weights_satisfy_claim_with_linear_constraints() {
+        // For any polynomial p (given in evaluation form), if we set each constraint's expected
+        // value to the *true* evaluation/linear-functional result, then the combined weight table
+        // W produced by batching must satisfy: <p, W> = S.
+        // This is the algebraic invariant required by the WHIR sumcheck.
+
+        let mut rng = SmallRng::seed_from_u64(0xDEADBEEF);
+        let k = 8;
+
+        // Random polynomial in evaluation form over {0,1}^k.
+        let poly_vals = (0..(1 << k))
+            .map(|_| F::from_u64((rng.random::<u32>() % 1_000) as u64))
+            .collect::<Vec<_>>();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Point constraints: expected = p(point).
+        for _ in 0..3 {
+            let point = MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+            let expected = poly.evaluate_hypercube_base::<F>(&point);
+            statement.add_evaluated_constraint(point, expected);
+        }
+
+        // Linear constraints: expected = <poly, weights>.
+        for _ in 0..3 {
+            let weights = (0..(1 << k))
+                .map(|_| F::from_u64((rng.random::<u32>() % 97) as u64))
+                .collect::<Vec<_>>();
+            let weights = EvaluationsList::new(weights);
+            let expected = dot_product::<F, _, _>(poly.iter().copied(), weights.iter().copied());
+            statement.add_linear_constraint(weights, expected);
+        }
+
+        let gamma = F::from_u64(11);
+        let mut combined_weights = EvaluationsList::zero(k);
+        let mut combined_sum = F::ZERO;
+        statement.combine_hypercube::<F, false>(&mut combined_weights, &mut combined_sum, gamma);
+
+        let lhs = dot_product::<F, _, _>(poly.iter().copied(), combined_weights.iter().copied());
+        assert_eq!(lhs, combined_sum);
+    }
+
+    // =====================================================================
+    // Tensor-product constraint tests
+    // =====================================================================
+
+    /// Helper: materializes a tensor-product constraint into an equivalent dense weight vector
+    /// of length `2^num_variables`, with the Kronecker product placed at the specified range.
+    fn materialize_tensor_product(
+        num_variables: usize,
+        range_start: usize,
+        row_weights: &EvaluationsList<F>,
+        col_weights: &EvaluationsList<F>,
+    ) -> EvaluationsList<F> {
+        let total_len = 1usize << num_variables;
+        let row_len = col_weights.num_evals();
+        let rows = row_weights.num_evals();
+        let mut dense = F::zero_vec(total_len);
+        for r in 0..rows {
+            for c in 0..row_len {
+                dense[range_start + r * row_len + c] =
+                    row_weights.as_slice()[r] * col_weights.as_slice()[c];
+            }
+        }
+        EvaluationsList::new(dense)
+    }
+
+    #[test]
+    fn test_tensor_product_verify_valid_2x2() {
+        // 4-variable polynomial (16 evaluations).
+        // Place a 2×2 tensor-product constraint in the first 4 positions.
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        // row_weights = [2, 5], col_weights = [3, 7]
+        // Dense block: [6, 14, 15, 35]
+        let row_w = EvaluationsList::new(vec![F::from_u64(2), F::from_u64(5)]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(3), F::from_u64(7)]);
+
+        // Compute the correct inner product manually:
+        // <poly[0..4], [6, 14, 15, 35]> = 1*6 + 2*14 + 3*15 + 4*35 = 6+28+45+140 = 219
+        let expected_eval = F::from_u64(219);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(
+            0, // range_start
+            2, // log_range_len (2^2 = 4)
+            row_w,
+            col_w,
+            expected_eval,
+        );
+
+        assert!(statement.verify(&poly));
+    }
+
+    #[test]
+    fn test_tensor_product_verify_wrong_eval() {
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let row_w = EvaluationsList::new(vec![F::from_u64(2), F::from_u64(5)]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(3), F::from_u64(7)]);
+
+        // Provide a wrong expected evaluation.
+        let wrong_eval = F::from_u64(999);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(0, 2, row_w, col_w, wrong_eval);
+
+        assert!(!statement.verify(&poly));
+    }
+
+    #[test]
+    fn test_tensor_product_verify_with_offset() {
+        // Place the 4×2 tensor-product block at range_start = 8 inside a 16-element poly.
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals.clone());
+
+        let row_w = EvaluationsList::new(vec![F::TWO; 4]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(3), F::ONE]);
+
+        // Block is at positions 8..16.  Dense weights = [6, 2, 6, 2, 6, 2, 6, 2].
+        // Inner product = sum_{i=8..15} poly[i] * dense[i-8]
+        let mut expected = F::ZERO;
+        for r in 0..4u64 {
+            for c in 0..2u64 {
+                let idx = 8 + r as usize * 2 + c as usize;
+                let w = F::TWO * if c == 0 { F::from_u64(3) } else { F::ONE };
+                expected += poly_vals[idx] * w;
+            }
+        }
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(8, 3, row_w, col_w, expected);
+
+        assert!(statement.verify(&poly));
+    }
+
+    #[test]
+    fn test_tensor_product_matches_dense_combine() {
+        // Verify that a tensor-product constraint and its materialized dense equivalent
+        // produce identical combined weight tables and sums via `combine_hypercube`.
+        let k = 4;
+        let range_start = 0;
+        let log_range_len = 2; // 2×2 block
+
+        let row_w = EvaluationsList::new(vec![F::from_u64(2), F::from_u64(5)]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(3), F::from_u64(7)]);
+        let eval = F::from_u64(42);
+        let gamma = F::from_u64(11);
+
+        // Statement with tensor-product constraint.
+        let mut tp_statement = EqStatement::<F>::initialize(k);
+        tp_statement.add_tensor_product_constraint(
+            range_start,
+            log_range_len,
+            row_w.clone(),
+            col_w.clone(),
+            eval,
+        );
+
+        // Statement with equivalent dense constraint.
+        let dense_weights = materialize_tensor_product(k, range_start, &row_w, &col_w);
+        let mut dense_statement = EqStatement::<F>::initialize(k);
+        dense_statement.add_linear_constraint(dense_weights, eval);
+
+        // Combine both.
+        let mut tp_combined = EvaluationsList::zero(k);
+        let mut tp_sum = F::ZERO;
+        tp_statement.combine_hypercube::<F, false>(&mut tp_combined, &mut tp_sum, gamma);
+
+        let mut dense_combined = EvaluationsList::zero(k);
+        let mut dense_sum = F::ZERO;
+        dense_statement.combine_hypercube::<F, false>(&mut dense_combined, &mut dense_sum, gamma);
+
+        assert_eq!(tp_sum, dense_sum);
+        assert_eq!(tp_combined, dense_combined);
+    }
+
+    #[test]
+    fn test_tensor_product_matches_dense_with_point_constraints() {
+        // Mix point constraints and a tensor-product constraint, compare against
+        // the same setup with a dense linear constraint.
+        let k = 4;
+        let gamma = F::from_u64(7);
+
+        let row_w = EvaluationsList::new(vec![F::from_u64(3), F::from_u64(11)]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(5), F::from_u64(9)]);
+        let lin_eval = F::from_u64(100);
+
+        let points = vec![
+            MultilinearPoint::new(vec![F::ONE, F::ZERO, F::ONE, F::ZERO]),
+            MultilinearPoint::new(vec![F::ZERO, F::ONE, F::ZERO, F::ONE]),
+        ];
+        let evals = vec![F::from_u64(10), F::from_u64(20)];
+
+        // Tensor-product statement.
+        let mut tp_stmt = EqStatement::<F>::initialize(k);
+        for (p, e) in points.iter().zip(evals.iter()) {
+            tp_stmt.add_evaluated_constraint(p.clone(), *e);
+        }
+        tp_stmt.add_tensor_product_constraint(0, 2, row_w.clone(), col_w.clone(), lin_eval);
+
+        // Dense statement.
+        let mut dense_stmt = EqStatement::<F>::initialize(k);
+        for (p, e) in points.iter().zip(evals.iter()) {
+            dense_stmt.add_evaluated_constraint(p.clone(), *e);
+        }
+        let dense_w = materialize_tensor_product(k, 0, &row_w, &col_w);
+        dense_stmt.add_linear_constraint(dense_w, lin_eval);
+
+        let mut tp_combined = EvaluationsList::zero(k);
+        let mut tp_sum = F::ZERO;
+        tp_stmt.combine_hypercube::<F, false>(&mut tp_combined, &mut tp_sum, gamma);
+
+        let mut dense_combined = EvaluationsList::zero(k);
+        let mut dense_sum = F::ZERO;
+        dense_stmt.combine_hypercube::<F, false>(&mut dense_combined, &mut dense_sum, gamma);
+
+        assert_eq!(tp_sum, dense_sum);
+        assert_eq!(tp_combined, dense_combined);
+    }
+
+    #[test]
+    fn test_tensor_product_packed_matches_unpacked() {
+        // Verify that `combine_hypercube` and `combine_hypercube_packed` produce
+        // identical results when tensor-product constraints are present.
+        type Base = F;
+        let k = 8;
+        let k_pack = log2_strict_usize(<Base as Field>::Packing::WIDTH);
+        assert!(k >= k_pack);
+
+        let mut rng = SmallRng::seed_from_u64(0xBEEF);
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Add a point constraint.
+        let point = MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+        statement.add_evaluated_constraint(point, F::from_u64(42));
+
+        // Add two tensor-product constraints at different offsets.
+        // Block size 2^4 = 16, placed at offset 0 and offset 16.
+        for offset in [0usize, 16] {
+            let row_w = EvaluationsList::new((0..4).map(|i| F::from_u64(i as u64 + 2)).collect());
+            let col_w =
+                EvaluationsList::new((0..4).map(|i| F::from_u64(i as u64 * 3 + 1)).collect());
+            let eval = F::from_u64(offset as u64 + 77);
+            statement.add_tensor_product_constraint(offset, 4, row_w, col_w, eval);
+        }
+
+        let gamma = F::from_u64(13);
+
+        // Unpacked.
+        let mut weights_unpacked = EvaluationsList::zero(k);
+        let mut sum_unpacked = F::ZERO;
+        statement.combine_hypercube::<Base, false>(&mut weights_unpacked, &mut sum_unpacked, gamma);
+
+        // Packed.
+        let mut weights_packed =
+            EvaluationsList::<<F as ExtensionField<Base>>::ExtensionPacking>::zero(k - k_pack);
+        let mut sum_packed = F::ZERO;
+        statement.combine_hypercube_packed::<Base, false>(
+            &mut weights_packed,
+            &mut sum_packed,
+            gamma,
+        );
+
+        assert_eq!(sum_unpacked, sum_packed);
+
+        let mut unpacked = Vec::with_capacity(1 << k);
+        for packed in &weights_packed.0 {
+            let slice: &[F] = PackedValue::as_slice(packed);
+            unpacked.extend_from_slice(slice);
+        }
+        unpacked.truncate(1 << k);
+        assert_eq!(unpacked, weights_unpacked.0);
+    }
+
+    #[test]
+    fn test_tensor_product_combined_weights_satisfy_claim() {
+        // For a random polynomial, create tensor-product constraints with *correct*
+        // expected values. After combining, verify <poly, W> == S.
+        let mut rng = SmallRng::seed_from_u64(0xCAFE);
+        let k = 8;
+
+        let poly_vals: Vec<F> = (0..(1 << k))
+            .map(|_| F::from_u64((rng.random::<u32>() % 1_000) as u64))
+            .collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Add a point constraint.
+        let point = MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+        let point_eval = poly.evaluate_hypercube_base::<F>(&point);
+        statement.add_evaluated_constraint(point, point_eval);
+
+        // Add 3 tensor-product constraints at offsets 0, 64, 128.
+        // Each block has size 2^6 = 64 (8 rows × 8 cols).
+        for offset in [0usize, 64, 128] {
+            let row_w = EvaluationsList::new(
+                (0..8)
+                    .map(|_| F::from_u64((rng.random::<u32>() % 50) as u64))
+                    .collect(),
+            );
+            let col_w = EvaluationsList::new(
+                (0..8)
+                    .map(|_| F::from_u64((rng.random::<u32>() % 50) as u64))
+                    .collect(),
+            );
+            // Compute the true inner product.
+            let dense = materialize_tensor_product(k, offset, &row_w, &col_w);
+            let true_eval = dot_product::<F, _, _>(poly.iter().copied(), dense.iter().copied());
+            statement.add_tensor_product_constraint(offset, 6, row_w, col_w, true_eval);
+        }
+
+        let gamma = F::from_u64(17);
+        let mut combined_weights = EvaluationsList::zero(k);
+        let mut combined_sum = F::ZERO;
+        statement.combine_hypercube::<F, false>(&mut combined_weights, &mut combined_sum, gamma);
+
+        let lhs = dot_product::<F, _, _>(poly.iter().copied(), combined_weights.iter().copied());
+        assert_eq!(lhs, combined_sum);
+    }
+
+    #[test]
+    fn test_tensor_product_single_row() {
+        // A 1×N block is trivially a tensor product with row_weights = [1].
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let row_w = EvaluationsList::new(vec![F::ONE]);
+        let col_w =
+            EvaluationsList::new(vec![F::from_u64(2), F::from_u64(3), F::ONE, F::from_u64(4)]);
+
+        // Expected = <poly[0..4], col_w> = 1*2 + 2*3 + 3*1 + 4*4 = 2+6+3+16 = 27
+        let expected = F::from_u64(27);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(0, 2, row_w, col_w, expected);
+        assert!(statement.verify(&poly));
+    }
+
+    #[test]
+    fn test_tensor_product_single_col() {
+        // An N×1 block: col_weights = [1], only row structure matters.
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let row_w =
+            EvaluationsList::new(vec![F::from_u64(2), F::from_u64(5), F::from_u64(3), F::ONE]);
+        let col_w = EvaluationsList::new(vec![F::ONE]);
+
+        // Block at offset 0, size 4×1 = 4. log_range_len = 2.
+        // Expected = 1*2 + 2*5 + 3*3 + 4*1 = 2+10+9+4 = 25
+        let expected = F::from_u64(25);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(0, 2, row_w, col_w, expected);
+        assert!(statement.verify(&poly));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_tensor_product_mismatched_dimensions() {
+        // row_weights.num_evals() * col_weights.num_evals() != 2^log_range_len should panic.
+        let mut statement = EqStatement::<F>::initialize(4);
+        let row_w = EvaluationsList::new(vec![F::ONE; 2]);
+        let col_w = EvaluationsList::new(vec![F::ONE; 2]);
+        // log_range_len = 3 => range_len = 8, but 2*2 = 4 != 8
+        statement.add_tensor_product_constraint(0, 3, row_w, col_w, F::ZERO);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_tensor_product_unaligned_range_start() {
+        // range_start not aligned to 2^log_range_len should panic.
+        let mut statement = EqStatement::<F>::initialize(4);
+        let row_w = EvaluationsList::new(vec![F::ONE; 2]);
+        let col_w = EvaluationsList::new(vec![F::ONE; 2]);
+        // log_range_len = 2, range_len = 4, but range_start = 2 is not aligned to 4.
+        statement.add_tensor_product_constraint(2, 2, row_w, col_w, F::ZERO);
     }
 }
