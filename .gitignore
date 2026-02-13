@@ -29,3 +29,5 @@ proptest-regressions/
 
 # Profile data
 profile.json
+
+**.DS_Store

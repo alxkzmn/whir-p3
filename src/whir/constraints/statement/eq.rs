@@ -687,15 +687,17 @@ impl<F: Field> EqStatement<F> {
                             let log_row_len = log2_strict_usize(row_len);
                             for pack_idx in start_pack..=end_pack {
                                 let base = pack_idx * pack_width;
-                                for i in 0..pack_width {
+                                for (i, scratch_elem) in
+                                    scratch.iter_mut().enumerate().take(pack_width)
+                                {
                                     let idx = base + i;
                                     if idx >= *range_start && idx < range_end {
                                         let local = idx - range_start;
                                         let row = local >> log_row_len;
                                         let col = local & (row_len - 1);
-                                        scratch[i] = row_weights.0[row] * col_weights.0[col];
+                                        *scratch_elem = row_weights.0[row] * col_weights.0[col];
                                     } else {
-                                        scratch[i] = F::ZERO;
+                                        *scratch_elem = F::ZERO;
                                     }
                                 }
                                 let packed = F::ExtensionPacking::from_ext_slice(&scratch);
@@ -779,15 +781,16 @@ impl<F: Field> EqStatement<F> {
                         let log_row_len = log2_strict_usize(row_len);
                         for pack_idx in start_pack..=end_pack {
                             let base = pack_idx * pack_width;
-                            for i in 0..pack_width {
+                            for (i, scratch_elem) in scratch.iter_mut().enumerate().take(pack_width)
+                            {
                                 let idx = base + i;
                                 if idx >= *range_start && idx < range_end {
                                     let local = idx - range_start;
                                     let row = local >> log_row_len;
                                     let col = local & (row_len - 1);
-                                    scratch[i] = row_weights.0[row] * col_weights.0[col];
+                                    *scratch_elem = row_weights.0[row] * col_weights.0[col];
                                 } else {
-                                    scratch[i] = F::ZERO;
+                                    *scratch_elem = F::ZERO;
                                 }
                             }
                             let packed = F::ExtensionPacking::from_ext_slice(&scratch);
