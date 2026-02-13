@@ -1,4 +1,6 @@
 use alloc::{vec, vec::Vec};
+#[cfg(test)]
+use alloc::format;
 
 use itertools::Itertools;
 use p3_field::{

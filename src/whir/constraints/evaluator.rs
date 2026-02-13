@@ -1,4 +1,6 @@
 use alloc::{vec, vec::Vec};
+#[cfg(test)]
+use alloc::format;
 
 use p3_field::{ExtensionField, Field, TwoAdicField};
 use p3_interpolation::interpolate_subgroup;

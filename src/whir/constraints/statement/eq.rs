@@ -1,3 +1,5 @@
+#[cfg(test)]
+use alloc::format;
 use alloc::{vec, vec::Vec};
 
 use itertools::Itertools;
@@ -99,11 +101,73 @@ fn packed_batch_eqs<F: Field, EF: ExtensionField<F>>(
 /// - Every `MultilinearPoint` in `points` has exactly `num_variables` coordinates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinearConstraint<F> {
+    /// A dense weight vector over the full `2^num_variables`-sized Boolean hypercube.
     Dense(EvaluationsList<F>),
+
+    /// A tensor-product (Kronecker) constraint over a contiguous, aligned block of
+    /// the concatenated evaluation vector.
+    ///
+    /// # Validity requirements
+    ///
+    /// A weight matrix can be represented as a `TensorProduct` **only when** both of the
+    /// following hold:
+    ///
+    /// 1. The non-zero weights occupy a contiguous power-of-two block
+    ///    `[range_start, range_start + 2^log_range_len)` of the evaluation vector,
+    ///    with `range_start` aligned to `2^log_range_len`.
+    ///
+    /// 2. The weight at position `(row, col)` within the block satisfies:
+    ///    ```text
+    ///    w[row, col] = row_weights[row] * col_weights[col]
+    ///    ```
+    ///    i.e. the weight matrix is a rank-1 outer product (Kronecker product) of
+    ///    `row_weights` and `col_weights`.
+    ///
+    /// ## Valid example
+    ///
+    /// A 2×4 block with `row_weights = [2, 5]` and `col_weights = [3, 7, 0, 0]`:
+    ///
+    /// ```text
+    /// row 0: [ 2*3, 2*7, 2*0, 2*0 ] = [ 6, 14,  0,  0 ]
+    /// row 1: [ 5*3, 5*7, 5*0, 5*0 ] = [ 15, 35, 0,  0 ]
+    /// ```
+    ///
+    /// Flattened: `[6, 14, 0, 0, 15, 35, 0, 0]`.
+    ///
+    /// More generally, any weight matrix like:
+    ///
+    /// ```text
+    /// row_weights = [2, 5], col_weights = [3, 7, 11]
+    /// row 0: [ 6, 14, 22 ]
+    /// row 1: [ 15, 35, 55 ]
+    /// ```
+    ///
+    /// is a valid tensor product (though both dimensions must be powers of two in this
+    /// implementation because `EvaluationsList` requires power-of-two lengths).
+    ///
+    /// ## Invalid example
+    ///
+    /// The 2×2 identity matrix `[[1, 0], [0, 1]]` **cannot** be expressed as a tensor product.
+    /// If it could, there would exist `row_weights = [r0, r1]` and `col_weights = [c0, c1]`
+    /// such that:
+    ///
+    /// ```text
+    /// r0*c0 = 1  =>  r0 ≠ 0, c0 ≠ 0
+    /// r0*c1 = 0  =>  c1 = 0   (since r0 ≠ 0)
+    /// r1*c1 = 1  =>  0 = 1    (contradiction)
+    /// ```
+    ///
+    /// Any weight matrix of rank > 1 fails this decomposition.
     TensorProduct {
+        /// Starting index of the non-zero block in the concatenated evaluation vector.
+        /// Must be aligned: `range_start % (1 << log_range_len) == 0`.
         range_start: usize,
+        /// Log₂ of the block length. The block spans `2^log_range_len` entries,
+        /// equal to `row_weights.num_evals() * col_weights.num_evals()`.
         log_range_len: usize,
+        /// Weight vector over the "row" dimension of the block.
         row_weights: EvaluationsList<F>,
+        /// Weight vector over the "column" dimension of the block.
         col_weights: EvaluationsList<F>,
     },
 }
@@ -387,10 +451,25 @@ impl<F: Field> EqStatement<F> {
         self.linear_evaluations.push(eval);
     }
 
-    /// Adds an explicit linear constraint with tensor-product structure over a contiguous range.
+    /// Adds an explicit linear constraint with tensor-product (Kronecker) structure over a
+    /// contiguous, aligned range of the evaluation vector.
     ///
-    /// The effective weight vector is zero outside `[range_start, range_start + 2^log_range_len)`.
-    /// Inside the range, weights are `row_weights \otimes col_weights` in row-major order.
+    /// The effective weight vector is zero outside
+    /// `[range_start, range_start + 2^log_range_len)`. Inside the range, the weight at
+    /// position `(row, col)` is `row_weights[row] * col_weights[col]` in row-major order.
+    ///
+    /// See [`LinearConstraint::TensorProduct`] for a detailed explanation of when a weight
+    /// matrix admits this decomposition (it must be a rank-1 outer product).
+    ///
+    /// # Panics
+    ///
+    /// - If `row_weights.num_evals() * col_weights.num_evals() != 2^log_range_len`.
+    /// - If `range_start` is not aligned to `2^log_range_len`.
+    ///
+    /// # Caller responsibility
+    ///
+    /// The caller must ensure that the weight matrix truly has Kronecker structure.
+    /// This method trusts the provided decomposition and does **not** verify it at runtime.
     pub fn add_tensor_product_constraint(
         &mut self,
         range_start: usize,
@@ -961,7 +1040,7 @@ mod tests {
         extension::BinomialExtensionField,
     };
     use proptest::prelude::*;
-    use rand::{SeedableRng, rngs::SmallRng};
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
 
     use super::*;
 
@@ -1674,5 +1753,351 @@ mod tests {
 
         let lhs = dot_product::<F, _, _>(poly.iter().copied(), combined_weights.iter().copied());
         assert_eq!(lhs, combined_sum);
+    }
+
+    // =====================================================================
+    // Tensor-product constraint tests
+    // =====================================================================
+
+    /// Helper: materializes a tensor-product constraint into an equivalent dense weight vector
+    /// of length `2^num_variables`, with the Kronecker product placed at the specified range.
+    fn materialize_tensor_product(
+        num_variables: usize,
+        range_start: usize,
+        row_weights: &EvaluationsList<F>,
+        col_weights: &EvaluationsList<F>,
+    ) -> EvaluationsList<F> {
+        let total_len = 1usize << num_variables;
+        let row_len = col_weights.num_evals();
+        let rows = row_weights.num_evals();
+        let mut dense = F::zero_vec(total_len);
+        for r in 0..rows {
+            for c in 0..row_len {
+                dense[range_start + r * row_len + c] =
+                    row_weights.as_slice()[r] * col_weights.as_slice()[c];
+            }
+        }
+        EvaluationsList::new(dense)
+    }
+
+    #[test]
+    fn test_tensor_product_verify_valid_2x2() {
+        // 4-variable polynomial (16 evaluations).
+        // Place a 2×2 tensor-product constraint in the first 4 positions.
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        // row_weights = [2, 5], col_weights = [3, 7]
+        // Dense block: [6, 14, 15, 35]
+        let row_w = EvaluationsList::new(vec![F::from_u64(2), F::from_u64(5)]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(3), F::from_u64(7)]);
+
+        // Compute the correct inner product manually:
+        // <poly[0..4], [6, 14, 15, 35]> = 1*6 + 2*14 + 3*15 + 4*35 = 6+28+45+140 = 219
+        let expected_eval = F::from_u64(219);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(
+            0, // range_start
+            2, // log_range_len (2^2 = 4)
+            row_w,
+            col_w,
+            expected_eval,
+        );
+
+        assert!(statement.verify(&poly));
+    }
+
+    #[test]
+    fn test_tensor_product_verify_wrong_eval() {
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let row_w = EvaluationsList::new(vec![F::from_u64(2), F::from_u64(5)]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(3), F::from_u64(7)]);
+
+        // Provide a wrong expected evaluation.
+        let wrong_eval = F::from_u64(999);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(0, 2, row_w, col_w, wrong_eval);
+
+        assert!(!statement.verify(&poly));
+    }
+
+    #[test]
+    fn test_tensor_product_verify_with_offset() {
+        // Place the 4×2 tensor-product block at range_start = 8 inside a 16-element poly.
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals.clone());
+
+        let row_w = EvaluationsList::new(vec![F::TWO; 4]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(3), F::ONE]);
+
+        // Block is at positions 8..16.  Dense weights = [6, 2, 6, 2, 6, 2, 6, 2].
+        // Inner product = sum_{i=8..15} poly[i] * dense[i-8]
+        let mut expected = F::ZERO;
+        for r in 0..4u64 {
+            for c in 0..2u64 {
+                let idx = 8 + r as usize * 2 + c as usize;
+                let w = F::TWO * if c == 0 { F::from_u64(3) } else { F::ONE };
+                expected += poly_vals[idx] * w;
+            }
+        }
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(8, 3, row_w, col_w, expected);
+
+        assert!(statement.verify(&poly));
+    }
+
+    #[test]
+    fn test_tensor_product_matches_dense_combine() {
+        // Verify that a tensor-product constraint and its materialized dense equivalent
+        // produce identical combined weight tables and sums via `combine_hypercube`.
+        let k = 4;
+        let range_start = 0;
+        let log_range_len = 2; // 2×2 block
+
+        let row_w = EvaluationsList::new(vec![F::from_u64(2), F::from_u64(5)]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(3), F::from_u64(7)]);
+        let eval = F::from_u64(42);
+        let gamma = F::from_u64(11);
+
+        // Statement with tensor-product constraint.
+        let mut tp_statement = EqStatement::<F>::initialize(k);
+        tp_statement.add_tensor_product_constraint(
+            range_start,
+            log_range_len,
+            row_w.clone(),
+            col_w.clone(),
+            eval,
+        );
+
+        // Statement with equivalent dense constraint.
+        let dense_weights = materialize_tensor_product(k, range_start, &row_w, &col_w);
+        let mut dense_statement = EqStatement::<F>::initialize(k);
+        dense_statement.add_linear_constraint(dense_weights, eval);
+
+        // Combine both.
+        let mut tp_combined = EvaluationsList::zero(k);
+        let mut tp_sum = F::ZERO;
+        tp_statement.combine_hypercube::<F, false>(&mut tp_combined, &mut tp_sum, gamma);
+
+        let mut dense_combined = EvaluationsList::zero(k);
+        let mut dense_sum = F::ZERO;
+        dense_statement.combine_hypercube::<F, false>(&mut dense_combined, &mut dense_sum, gamma);
+
+        assert_eq!(tp_sum, dense_sum);
+        assert_eq!(tp_combined, dense_combined);
+    }
+
+    #[test]
+    fn test_tensor_product_matches_dense_with_point_constraints() {
+        // Mix point constraints and a tensor-product constraint, compare against
+        // the same setup with a dense linear constraint.
+        let k = 4;
+        let gamma = F::from_u64(7);
+
+        let row_w = EvaluationsList::new(vec![F::from_u64(3), F::from_u64(11)]);
+        let col_w = EvaluationsList::new(vec![F::from_u64(5), F::from_u64(9)]);
+        let lin_eval = F::from_u64(100);
+
+        let points = vec![
+            MultilinearPoint::new(vec![F::ONE, F::ZERO, F::ONE, F::ZERO]),
+            MultilinearPoint::new(vec![F::ZERO, F::ONE, F::ZERO, F::ONE]),
+        ];
+        let evals = vec![F::from_u64(10), F::from_u64(20)];
+
+        // Tensor-product statement.
+        let mut tp_stmt = EqStatement::<F>::initialize(k);
+        for (p, e) in points.iter().zip(evals.iter()) {
+            tp_stmt.add_evaluated_constraint(p.clone(), *e);
+        }
+        tp_stmt.add_tensor_product_constraint(0, 2, row_w.clone(), col_w.clone(), lin_eval);
+
+        // Dense statement.
+        let mut dense_stmt = EqStatement::<F>::initialize(k);
+        for (p, e) in points.iter().zip(evals.iter()) {
+            dense_stmt.add_evaluated_constraint(p.clone(), *e);
+        }
+        let dense_w = materialize_tensor_product(k, 0, &row_w, &col_w);
+        dense_stmt.add_linear_constraint(dense_w, lin_eval);
+
+        let mut tp_combined = EvaluationsList::zero(k);
+        let mut tp_sum = F::ZERO;
+        tp_stmt.combine_hypercube::<F, false>(&mut tp_combined, &mut tp_sum, gamma);
+
+        let mut dense_combined = EvaluationsList::zero(k);
+        let mut dense_sum = F::ZERO;
+        dense_stmt.combine_hypercube::<F, false>(&mut dense_combined, &mut dense_sum, gamma);
+
+        assert_eq!(tp_sum, dense_sum);
+        assert_eq!(tp_combined, dense_combined);
+    }
+
+    #[test]
+    fn test_tensor_product_packed_matches_unpacked() {
+        // Verify that `combine_hypercube` and `combine_hypercube_packed` produce
+        // identical results when tensor-product constraints are present.
+        type Base = F;
+        let k = 8;
+        let k_pack = log2_strict_usize(<Base as Field>::Packing::WIDTH);
+        assert!(k >= k_pack);
+
+        let mut rng = SmallRng::seed_from_u64(0xBEEF);
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Add a point constraint.
+        let point = MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+        statement.add_evaluated_constraint(point, F::from_u64(42));
+
+        // Add two tensor-product constraints at different offsets.
+        // Block size 2^4 = 16, placed at offset 0 and offset 16.
+        for offset in [0usize, 16] {
+            let row_w = EvaluationsList::new((0..4).map(|i| F::from_u64(i as u64 + 2)).collect());
+            let col_w =
+                EvaluationsList::new((0..4).map(|i| F::from_u64(i as u64 * 3 + 1)).collect());
+            let eval = F::from_u64(offset as u64 + 77);
+            statement.add_tensor_product_constraint(offset, 4, row_w, col_w, eval);
+        }
+
+        let gamma = F::from_u64(13);
+
+        // Unpacked.
+        let mut weights_unpacked = EvaluationsList::zero(k);
+        let mut sum_unpacked = F::ZERO;
+        statement.combine_hypercube::<Base, false>(&mut weights_unpacked, &mut sum_unpacked, gamma);
+
+        // Packed.
+        let mut weights_packed =
+            EvaluationsList::<<F as ExtensionField<Base>>::ExtensionPacking>::zero(k - k_pack);
+        let mut sum_packed = F::ZERO;
+        statement.combine_hypercube_packed::<Base, false>(
+            &mut weights_packed,
+            &mut sum_packed,
+            gamma,
+        );
+
+        assert_eq!(sum_unpacked, sum_packed);
+
+        let mut unpacked = Vec::with_capacity(1 << k);
+        for packed in &weights_packed.0 {
+            let slice: &[F] = PackedValue::as_slice(packed);
+            unpacked.extend_from_slice(slice);
+        }
+        unpacked.truncate(1 << k);
+        assert_eq!(unpacked, weights_unpacked.0);
+    }
+
+    #[test]
+    fn test_tensor_product_combined_weights_satisfy_claim() {
+        // For a random polynomial, create tensor-product constraints with *correct*
+        // expected values. After combining, verify <poly, W> == S.
+        let mut rng = SmallRng::seed_from_u64(0xCAFE);
+        let k = 8;
+
+        let poly_vals: Vec<F> = (0..(1 << k))
+            .map(|_| F::from_u64((rng.random::<u32>() % 1_000) as u64))
+            .collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+
+        // Add a point constraint.
+        let point = MultilinearPoint::new((0..k).map(|_| F::from_bool(rng.random())).collect());
+        let point_eval = poly.evaluate_hypercube_base::<F>(&point);
+        statement.add_evaluated_constraint(point, point_eval);
+
+        // Add 3 tensor-product constraints at offsets 0, 64, 128.
+        // Each block has size 2^6 = 64 (8 rows × 8 cols).
+        for offset in [0usize, 64, 128] {
+            let row_w = EvaluationsList::new(
+                (0..8)
+                    .map(|_| F::from_u64((rng.random::<u32>() % 50) as u64))
+                    .collect(),
+            );
+            let col_w = EvaluationsList::new(
+                (0..8)
+                    .map(|_| F::from_u64((rng.random::<u32>() % 50) as u64))
+                    .collect(),
+            );
+            // Compute the true inner product.
+            let dense = materialize_tensor_product(k, offset, &row_w, &col_w);
+            let true_eval = dot_product::<F, _, _>(poly.iter().copied(), dense.iter().copied());
+            statement.add_tensor_product_constraint(offset, 6, row_w, col_w, true_eval);
+        }
+
+        let gamma = F::from_u64(17);
+        let mut combined_weights = EvaluationsList::zero(k);
+        let mut combined_sum = F::ZERO;
+        statement.combine_hypercube::<F, false>(&mut combined_weights, &mut combined_sum, gamma);
+
+        let lhs = dot_product::<F, _, _>(poly.iter().copied(), combined_weights.iter().copied());
+        assert_eq!(lhs, combined_sum);
+    }
+
+    #[test]
+    fn test_tensor_product_single_row() {
+        // A 1×N block is trivially a tensor product with row_weights = [1].
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let row_w = EvaluationsList::new(vec![F::ONE]);
+        let col_w =
+            EvaluationsList::new(vec![F::from_u64(2), F::from_u64(3), F::ONE, F::from_u64(4)]);
+
+        // Expected = <poly[0..4], col_w> = 1*2 + 2*3 + 3*1 + 4*4 = 2+6+3+16 = 27
+        let expected = F::from_u64(27);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(0, 2, row_w, col_w, expected);
+        assert!(statement.verify(&poly));
+    }
+
+    #[test]
+    fn test_tensor_product_single_col() {
+        // An N×1 block: col_weights = [1], only row structure matters.
+        let k = 4;
+        let poly_vals: Vec<F> = (1..=(1u64 << k)).map(F::from_u64).collect();
+        let poly = EvaluationsList::new(poly_vals);
+
+        let row_w =
+            EvaluationsList::new(vec![F::from_u64(2), F::from_u64(5), F::from_u64(3), F::ONE]);
+        let col_w = EvaluationsList::new(vec![F::ONE]);
+
+        // Block at offset 0, size 4×1 = 4. log_range_len = 2.
+        // Expected = 1*2 + 2*5 + 3*3 + 4*1 = 2+10+9+4 = 25
+        let expected = F::from_u64(25);
+
+        let mut statement = EqStatement::<F>::initialize(k);
+        statement.add_tensor_product_constraint(0, 2, row_w, col_w, expected);
+        assert!(statement.verify(&poly));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_tensor_product_mismatched_dimensions() {
+        // row_weights.num_evals() * col_weights.num_evals() != 2^log_range_len should panic.
+        let mut statement = EqStatement::<F>::initialize(4);
+        let row_w = EvaluationsList::new(vec![F::ONE; 2]);
+        let col_w = EvaluationsList::new(vec![F::ONE; 2]);
+        // log_range_len = 3 => range_len = 8, but 2*2 = 4 != 8
+        statement.add_tensor_product_constraint(0, 3, row_w, col_w, F::ZERO);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_tensor_product_unaligned_range_start() {
+        // range_start not aligned to 2^log_range_len should panic.
+        let mut statement = EqStatement::<F>::initialize(4);
+        let row_w = EvaluationsList::new(vec![F::ONE; 2]);
+        let col_w = EvaluationsList::new(vec![F::ONE; 2]);
+        // log_range_len = 2, range_len = 4, but range_start = 2 is not aligned to 4.
+        statement.add_tensor_product_constraint(2, 2, row_w, col_w, F::ZERO);
     }
 }
