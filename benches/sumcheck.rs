@@ -3,16 +3,16 @@ use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
 use p3_challenger::{DuplexChallenger, FieldChallenger, GrindingChallenger};
 use p3_field::extension::BinomialExtensionField;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use whir_p3::{
     fiat_shamir::domain_separator::DomainSeparator,
     parameters::{FoldingFactor, ProtocolParameters, errors::SecurityAssumption},
     poly::{evals::EvaluationsList, multilinear::MultilinearPoint},
-    sumcheck::sumcheck_single::SumcheckSingle,
+    sumcheck::sumcheck_prover::Sumcheck,
     whir::{
-        constraints::{Constraint, statement::EqStatement},
-        parameters::InitialPhaseConfig,
-        proof::{InitialPhase, SumcheckData, WhirProof},
+        constraints::statement::{EqStatement, initial::InitialStatement},
+        parameters::SumcheckStrategy,
+        proof::{SumcheckData, WhirProof},
     },
 };
 
@@ -31,7 +31,6 @@ fn create_test_protocol_params(
     let perm = Perm::new_from_rng_128(&mut rng);
 
     ProtocolParameters {
-        initial_phase_config: InitialPhaseConfig::WithStatementClassic,
         security_level: 32,
         pow_bits: 0,
         rs_domain_initial_reduction_factor: 1,
@@ -63,6 +62,7 @@ fn generate_statement<C>(
     num_vars: usize,
     poly: &EvaluationsList<F>,
     num_constraints: usize,
+    _strategy: SumcheckStrategy,
 ) -> EqStatement<EF>
 where
     C: FieldChallenger<F> + GrindingChallenger<Witness = F>,
@@ -71,7 +71,8 @@ where
     for _ in 0..num_constraints {
         let point =
             MultilinearPoint::expand_from_univariate(challenger.sample_algebra_element(), num_vars);
-        statement.add_unevaluated_constraint_hypercube(point, poly);
+        let eval = poly.evaluate_hypercube_base(&point);
+        statement.add_evaluated_constraint(point, eval);
     }
     statement
 }
@@ -96,51 +97,109 @@ fn bench_sumcheck_prover(c: &mut Criterion) {
         // Setup domain separator
         let domsep: DomainSeparator<EF, F> = DomainSeparator::new(vec![]);
 
-        group.bench_with_input(BenchmarkId::new("Classic", *num_vars), &poly, |b, poly| {
-            b.iter(|| {
-                // Setup fresh challenger for each iteration
-                let mut challenger = setup_challenger();
-                domsep.observe_domain_separator(&mut challenger);
+        // Setup base challenger state (cloned per iteration)
+        let mut challenger = setup_challenger();
+        domsep.observe_domain_separator(&mut challenger);
 
-                // Initialize proof
-                let mut proof =
-                    WhirProof::<F, EF, F, 8>::from_protocol_parameters(&params, *num_vars);
+        // Create constraint using challenger directly
+        let mut initial_statement = InitialStatement::new(
+            poly.clone(),
+            params.folding_factor.at_round(0),
+            SumcheckStrategy::Classic,
+        );
+        for _ in 0..3 {
+            let _ = initial_statement.evaluate(&MultilinearPoint::expand_from_univariate(
+                challenger.sample_algebra_element(),
+                *num_vars,
+            ));
+        }
 
-                // Create constraint using challenger directly
-                let statement = generate_statement(&mut challenger, *num_vars, poly, 3);
-                let alpha: EF = challenger.sample_algebra_element();
-                let constraint = Constraint::new_eq_only(alpha, statement);
+        group.bench_with_input(
+            BenchmarkId::new("Classic", *num_vars),
+            &(initial_statement, challenger.clone()),
+            |b, (initial_statement, challenger)| {
+                b.iter(|| {
+                    let mut challenger = challenger.clone();
+                    // Initialize proof
+                    let mut proof =
+                        WhirProof::<F, EF, F, 8>::from_protocol_parameters(&params, *num_vars);
 
-                // Extract sumcheck data from the initial phase
-                let InitialPhase::WithStatement { ref mut sumcheck } = proof.initial_phase else {
-                    panic!("Expected WithStatement variant");
-                };
-
-                // First round - fold first half of variables
-                let (mut sumcheck_prover, _) = SumcheckSingle::from_base_evals(
-                    poly,
-                    sumcheck,
-                    &mut challenger,
-                    classic_folding_schedule[0],
-                    0,
-                    &constraint,
-                );
-
-                // Second round - fold remaining variables
-                if classic_folding_schedule.len() > 1 && classic_folding_schedule[1] > 0 {
-                    let mut sumcheck_data: SumcheckData<EF, F> = SumcheckData::default();
-                    sumcheck_prover.compute_sumcheck_polynomials(
-                        &mut sumcheck_data,
+                    // First round - fold first half of variables
+                    let (mut sumcheck_prover, _) = Sumcheck::from_base_evals(
+                        &mut proof.initial_sumcheck,
                         &mut challenger,
                         classic_folding_schedule[1],
                         0,
-                        None,
+                        initial_statement,
                     );
-                    proof.set_final_sumcheck_data(sumcheck_data);
-                }
-            });
-        });
+
+                    // Second round - fold remaining variables
+                    if classic_folding_schedule.len() > 1 && classic_folding_schedule[1] > 0 {
+                        let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
+                        sumcheck_prover.compute_sumcheck_polynomials(
+                            &mut sumcheck_data,
+                            &mut challenger,
+                            classic_folding_schedule[1],
+                            0,
+                            None,
+                        );
+                        proof.set_final_sumcheck_data(sumcheck_data);
+                    }
+                });
+            },
+        );
+
+        // Create constraint using challenger directly
+        let mut initial_statement = InitialStatement::new(
+            poly.clone(),
+            params.folding_factor.at_round(0),
+            SumcheckStrategy::Svo,
+        );
+        for _ in 0..3 {
+            let _ = initial_statement.evaluate(&MultilinearPoint::expand_from_univariate(
+                challenger.sample_algebra_element(),
+                *num_vars,
+            ));
+        }
+
+        group.bench_with_input(
+            BenchmarkId::new("Svo", *num_vars),
+            &(initial_statement, challenger.clone()),
+            |b, (initial_statement, challenger)| {
+                b.iter(|| {
+                    let mut challenger = challenger.clone();
+                    let folding0 = params.folding_factor.at_round(0);
+
+                    // Initialize proof
+                    let mut proof =
+                        WhirProof::<F, EF, F, 8>::from_protocol_parameters(&params, *num_vars);
+
+                    // First round - for SVO this must match `l0` used in `InitialStatement::new`.
+                    let (mut sumcheck_prover, _) = Sumcheck::from_base_evals(
+                        &mut proof.initial_sumcheck,
+                        &mut challenger,
+                        folding0,
+                        0,
+                        initial_statement,
+                    );
+
+                    // Second round - fold remaining variables
+                    if classic_folding_schedule.len() > 1 && classic_folding_schedule[1] > 0 {
+                        let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
+                        sumcheck_prover.compute_sumcheck_polynomials(
+                            &mut sumcheck_data,
+                            &mut challenger,
+                            classic_folding_schedule[1],
+                            0,
+                            None,
+                        );
+                        proof.set_final_sumcheck_data(sumcheck_data);
+                    }
+                });
+            },
+        );
     }
+
     group.finish();
 }
 

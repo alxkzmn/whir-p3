@@ -1,8 +1,9 @@
-pub mod eq_state;
+pub mod lagrange;
 pub mod product_polynomial;
-pub mod sumcheck_single;
-pub mod sumcheck_single_skip;
-pub mod sumcheck_single_svo;
-pub mod sumcheck_small_value;
+pub mod sumcheck_prover;
+pub mod svo;
+
 #[cfg(test)]
 mod tests;
+
+pub(crate) use lagrange::extrapolate_012;

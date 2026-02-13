@@ -26,6 +26,7 @@ use tracing::instrument;
 
 use crate::{
     poly::{evals::EvaluationsList, multilinear::MultilinearPoint},
+    sumcheck::extrapolate_012,
     whir::{constraints::Constraint, proof::SumcheckData},
 };
 
@@ -110,65 +111,6 @@ pub(crate) enum ProductPolynomial<F: Field, EF: ExtensionField<F>> {
 }
 
 impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
-    /// Creates a new [`ProductPolynomial`] from extension field evaluations.
-    ///
-    /// Automatically selects the optimal representation (packed or scalar) based on
-    /// the polynomial size relative to the SIMD width.
-    ///
-    /// # Decision Criteria
-    ///
-    /// ```text
-    /// if num_variables > log_2(SIMD_WIDTH):
-    ///     -> Packed (SIMD benefits outweigh overhead)
-    /// else:
-    ///     -> Small (scalar operations are more efficient)
-    /// ```
-    ///
-    /// # Arguments
-    ///
-    /// * `evals` - Evaluations of the polynomial `f(x)` over the boolean hypercube.
-    /// * `weights` - Evaluations of the weight polynomial `w(x)`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `evals` and `weights` have different numbers of variables.
-    pub(crate) fn new(evals: EvaluationsList<EF>, weights: EvaluationsList<EF>) -> Self {
-        // Validate that both polynomials have the same number of variables.
-        //
-        // This is essential since they must be multiplied pointwise.
-        assert_eq!(evals.num_variables(), weights.num_variables());
-
-        // Determine the SIMD threshold: log_2(packing width).
-        //
-        // If num_variables > threshold, SIMD packing is beneficial.
-        let simd_threshold = log2_strict_usize(F::Packing::WIDTH);
-
-        if evals.num_variables() > simd_threshold {
-            // Convert scalar evaluations to packed format.
-            //
-            // We chunk consecutive evaluations into groups of SIMD_WIDTH and pack them.
-            // This enables parallel arithmetic on all elements within a chunk.
-            let evals = EvaluationsList::new(
-                evals
-                    .0
-                    .chunks(F::Packing::WIDTH)
-                    .map(EF::ExtensionPacking::from_ext_slice)
-                    .collect(),
-            );
-            let weights = EvaluationsList::new(
-                weights
-                    .0
-                    .chunks(F::Packing::WIDTH)
-                    .map(EF::ExtensionPacking::from_ext_slice)
-                    .collect(),
-            );
-            Self::new_packed(evals, weights)
-        } else {
-            // Polynomial is small enough that scalar operations are more efficient.
-            Self::new_small(evals, weights)
-        }
-    }
-
     /// Creates a packed variant and checks for immediate transition.
     ///
     /// This constructor is used when we know the data is already in packed format.
@@ -183,6 +125,7 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
         evals: EvaluationsList<EF::ExtensionPacking>,
         weights: EvaluationsList<EF::ExtensionPacking>,
     ) -> Self {
+        assert_eq!(evals.num_variables(), weights.num_variables());
         let mut poly = Self::Packed { evals, weights };
 
         // Check if we should immediately transition to scalar mode.
@@ -241,7 +184,7 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// * `point` - The evaluation point as a [`MultilinearPoint`].
     pub(crate) fn eval(&self, point: &MultilinearPoint<EF>) -> EF {
         match self {
-            Self::Packed { evals, .. } => evals.eval_hypercube_packed(point),
+            Self::Packed { evals, .. } => evals.evaluate_hypercube_packed(point),
             Self::Small { evals, .. } => evals.evaluate_hypercube_ext(point),
         }
     }
@@ -373,7 +316,7 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     #[instrument(skip_all)]
     pub(crate) fn round<Challenger>(
         &mut self,
-        sumcheck_data: &mut SumcheckData<EF, F>,
+        sumcheck_data: &mut SumcheckData<F, EF>,
         challenger: &mut Challenger,
         sum: &mut EF,
         pow_bits: usize,
@@ -415,17 +358,8 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
         //
         // Recall: h(X) = c_0 + c_1 * X + c_2 * X^2
         //
-        // From the sumcheck constraint: h(0) + h(1) = claimed_sum
-        //   -> c_0 + (c_0 + c_1 + c_2) = claimed_sum
-        //   -> c_1 = claimed_sum - 2 * c_0 - c_2
-        //
-        // Therefore: h(r) = c_0 + c_1 * r + c_2 * r^2
-        //                 = c_0 + (claimed_sum - 2 * c_0 - c_2) * r + c_2 * r^2
-        //                 = c_2 * r^2 + (h(1) - c_0 - c_2) * r + c_0
-        //
-        // where h(1) = claimed_sum - c_0.
-        let h_1 = *sum - c0;
-        *sum = c2 * r.square() + (h_1 - c0 - c2) * r + c0;
+        // Update sum := h(r)
+        *sum = extrapolate_012(c0, *sum - c0, c2, r);
 
         // Sanity check: the updated sum should equal the inner product after folding.
         debug_assert_eq!(*sum, self.dot_product());
@@ -520,108 +454,25 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::{format, vec, vec::Vec};
 
-    use p3_baby_bear::BabyBear;
+    use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
+    use p3_challenger::DuplexChallenger;
     use p3_field::{Field, PrimeCharacteristicRing, extension::BinomialExtensionField};
-    use rand::{Rng, SeedableRng, rngs::SmallRng};
+    use proptest::prelude::*;
+    use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
     use super::*;
 
     type F = BabyBear;
     type EF = BinomialExtensionField<BabyBear, 4>;
+    type Perm = Poseidon2BabyBear<16>;
+    type TestChallenger = DuplexChallenger<F, Perm, 16, 8>;
 
-    #[test]
-    fn test_new_selects_small_variant_for_small_polynomials() {
-        // Create polynomials at the SIMD threshold boundary.
-        //
-        // The Small variant is selected when: num_variables <= log_2(SIMD_WIDTH)
-        // We create a polynomial with exactly simd_log variables to ensure Small variant.
-        let simd_width = <F as Field>::Packing::WIDTH;
-        let simd_log = log2_strict_usize(simd_width);
-        let num_evals = 1 << simd_log;
-
-        // Create evaluation vectors at the threshold size.
-        let evals_vec: Vec<EF> = (0..num_evals).map(|i| EF::from_u64(i as u64 + 1)).collect();
-        let weights_vec: Vec<EF> = (0..num_evals)
-            .map(|i| EF::from_u64(i as u64 + num_evals as u64 + 1))
-            .collect();
-
-        let evals = EvaluationsList::new(evals_vec.clone());
-        let weights = EvaluationsList::new(weights_vec.clone());
-
-        let poly = ProductPolynomial::<F, EF>::new(evals, weights);
-
-        // Verify it selected the Small variant and check internal state.
-        match &poly {
-            ProductPolynomial::Small { evals, weights } => {
-                // Verify stored evaluations match input.
-                assert_eq!(evals.as_slice(), &evals_vec);
-                assert_eq!(weights.as_slice(), &weights_vec);
-            }
-            ProductPolynomial::Packed { .. } => {
-                panic!(
-                    "Expected Small variant for {}-variable polynomial (SIMD threshold = {})",
-                    simd_log, simd_log
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_new_selects_packed_variant_for_large_polynomials() {
-        // Create polynomials above the SIMD threshold.
-        //
-        // The Packed variant is selected when: num_variables > log_2(SIMD_WIDTH)
-        // We create a polynomial with simd_log + 2 variables to ensure Packed variant.
-        let simd_width = <F as Field>::Packing::WIDTH;
-        let simd_log = log2_strict_usize(simd_width);
-        let num_vars = simd_log + 2;
-        let num_evals = 1 << num_vars;
-
-        let evals_vec: Vec<EF> = (0..num_evals).map(|i| EF::from_u64(i as u64)).collect();
-        let weights_vec: Vec<EF> = (0..num_evals)
-            .map(|i| EF::from_u64(100 + i as u64))
-            .collect();
-
-        let evals = EvaluationsList::new(evals_vec.clone());
-        let weights = EvaluationsList::new(weights_vec.clone());
-
-        let poly = ProductPolynomial::<F, EF>::new(evals, weights);
-
-        // Verify it selected the Packed variant.
-        match &poly {
-            ProductPolynomial::Packed {
-                evals: packed_evals,
-                weights: packed_weights,
-            } => {
-                // With num_evals elements and SIMD width, we get num_evals/simd_width packed elements.
-                let expected_packed_len = num_evals / simd_width;
-                assert_eq!(packed_evals.num_evals(), expected_packed_len);
-                assert_eq!(packed_weights.num_evals(), expected_packed_len);
-            }
-            ProductPolynomial::Small { .. } => {
-                panic!(
-                    "Expected Packed variant for {}-variable polynomial (SIMD threshold = {})",
-                    num_vars, simd_log
-                );
-            }
-        }
-
-        // Verify evals() correctly unpacks to original values.
-        assert_eq!(poly.evals().as_slice(), &evals_vec);
-        assert_eq!(poly.weights().as_slice(), &weights_vec);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_new_panics_on_mismatched_sizes() {
-        // Evals has 4 elements (2 variables), weights has 8 elements (3 variables).
-        let evals = EvaluationsList::new(vec![EF::ONE; 4]);
-        let weights = EvaluationsList::new(vec![EF::TWO; 8]);
-
-        // This should panic because evals and weights have different num_variables.
-        let _ = ProductPolynomial::<F, EF>::new(evals, weights);
+    /// Creates a test challenger with a deterministic seed.
+    fn make_challenger() -> TestChallenger {
+        let perm = Perm::new_from_rng_128(&mut SmallRng::seed_from_u64(42));
+        DuplexChallenger::new(perm)
     }
 
     #[test]
@@ -635,24 +486,6 @@ mod tests {
 
         // The logical number of variables should be 3 (since 2^3 = 8).
         assert_eq!(poly.num_variables(), 3);
-    }
-
-    #[test]
-    fn test_num_variables_packed_variant() {
-        // Create a Packed variant with 6 variables (64 evaluations).
-        //
-        // After packing with SIMD width 16, we have:
-        //   - 64 / 16 = 4 packed elements
-        //   - stored_variables = log_2(4) = 2
-        //   - total_variables = stored_variables + log_2(16) = 2 + 4 = 6
-        let evals = EvaluationsList::new(vec![EF::ONE; 64]);
-        let weights = EvaluationsList::new(vec![EF::TWO; 64]);
-
-        let poly = ProductPolynomial::<F, EF>::new(evals, weights);
-
-        // Verify it's Packed and has correct num_variables.
-        assert!(matches!(poly, ProductPolynomial::Packed { .. }));
-        assert_eq!(poly.num_variables(), 6);
     }
 
     #[test]
@@ -688,19 +521,9 @@ mod tests {
         //   evals   = [e0, e1] where f(0) = e0, f(1) = e1
         //   weights = [w0, w1] where g(0) = w0, g(1) = w1
         //
-        // The sumcheck polynomial h(X) = f(X) * g(X) where:
-        //   f(X) = e0 + (e1 - e0)*X
-        //   g(X) = w0 + (w1 - w0)*X
-        //
-        // h(X) = [e0 + (e1-e0)*X] * [w0 + (w1-w0)*X]
-        //      = e0*w0 + [e0*(w1-w0) + (e1-e0)*w0]*X + (e1-e0)*(w1-w0)*X^2
-        //      = c0 + c1*X + c2*X^2
-        //
-        // where:
-        //   c0 = e0 * w0
-        //   c2 = (e1 - e0) * (w1 - w0)
-        //
-        // The sumcheck_coefficients function returns (c0, c2).
+        // sumcheck_coefficients returns (h(0), h(2)) where:
+        //   h(0) = f(0) * g(0) = e0 * w0
+        //   h(2) = f(2) * g(2) = (2*e1 - e0) * (2*w1 - w0)
         let e0 = EF::from_u64(3);
         let e1 = EF::from_u64(7);
         let w0 = EF::from_u64(2);
@@ -709,21 +532,21 @@ mod tests {
         let evals = EvaluationsList::new(vec![e0, e1]);
         let weights = EvaluationsList::new(vec![w0, w1]);
 
-        let (c0, c2) = evals.sumcheck_coefficients(&weights);
+        let (h0, h2) = evals.sumcheck_coefficients(&weights);
 
-        // c0 = e0 * w0
-        let expected_c0 = e0 * w0;
-        assert_eq!(c0, expected_c0);
+        // h(0) = e0 * w0
+        let expected_h0 = e0 * w0;
+        assert_eq!(h0, expected_h0);
 
-        // c2 = (e1 - e0) * (w1 - w0)
-        let expected_c2 = (e1 - e0) * (w1 - w0);
-        assert_eq!(c2, expected_c2);
+        // h(2) = (2*e1 - e0) * (2*w1 - w0)
+        let expected_h2 = (e1.double() - e0) * (w1.double() - w0);
+        assert_eq!(h2, expected_h2);
 
         // Verify consistency: h(0) + h(1) should equal the claimed sum.
         // h(0) = c0
         // h(1) = e1 * w1
         // sum = e0*w0 + e1*w1
-        let h_0 = c0;
+        let h_0 = h0;
         let h_1 = e1 * w1;
         let sum = e0 * w0 + e1 * w1;
         assert_eq!(h_0 + h_1, sum);
@@ -843,18 +666,34 @@ mod tests {
         //
         // The SIMD threshold is log_2(F::Packing::WIDTH).
         // We need a polynomial large enough to start in Packed mode.
+        type EP = <EF as ExtensionField<F>>::ExtensionPacking;
+
         let simd_width = <F as Field>::Packing::WIDTH;
         let simd_log = log2_strict_usize(simd_width);
 
         // Start with simd_log + 2 variables (e.g., if simd_width=16, start with 6 vars = 64 evals).
-        // This gives us 2 packed elements initially (1 stored variable).
+        // This gives us 4 packed elements initially (2 stored variables).
         let num_vars = simd_log + 2;
         let num_evals = 1 << num_vars;
 
-        let evals = EvaluationsList::new(vec![EF::ONE; num_evals]);
-        let weights = EvaluationsList::new(vec![EF::ONE; num_evals]);
+        // Create scalar evaluations and pack them
+        let evals_scalar = vec![EF::ONE; num_evals];
+        let weights_scalar = vec![EF::ONE; num_evals];
 
-        let mut poly = ProductPolynomial::<F, EF>::new(evals, weights);
+        let packed_evals = EvaluationsList::new(
+            evals_scalar
+                .chunks(simd_width)
+                .map(EP::from_ext_slice)
+                .collect(),
+        );
+        let packed_weights = EvaluationsList::new(
+            weights_scalar
+                .chunks(simd_width)
+                .map(EP::from_ext_slice)
+                .collect(),
+        );
+
+        let mut poly = ProductPolynomial::<F, EF>::new_packed(packed_evals, packed_weights);
 
         // Initially should be Packed with correct internal structure.
         match &poly {
@@ -936,40 +775,373 @@ mod tests {
     }
 
     #[test]
-    fn test_consistency_between_variants() {
-        // Create the same logical polynomial in both variants and verify they behave identically.
-        let mut rng = SmallRng::seed_from_u64(999);
+    fn test_round_updates_sum_correctly() {
+        // Test the round() function which is the core sumcheck protocol.
+        //
+        // The round function should:
+        // 1. Compute sumcheck coefficients (c0, c2)
+        // 2. Update the claimed sum to h(r) where r is the challenge
+        // 3. Fold both polynomials
+        // 4. Return the challenge r
+        //
+        // Verify: after round(), dot_product() == updated sum
+        let e0 = EF::from_u64(2);
+        let e1 = EF::from_u64(5);
+        let e2 = EF::from_u64(3);
+        let e3 = EF::from_u64(7);
+        let w0 = EF::from_u64(1);
+        let w1 = EF::from_u64(4);
+        let w2 = EF::from_u64(2);
+        let w3 = EF::from_u64(6);
 
-        // Use 4 variables (16 elements) - at SIMD boundary.
-        let evals_vec: Vec<EF> = (0..16).map(|_| rng.random()).collect();
-        let weights_vec: Vec<EF> = (0..16).map(|_| rng.random()).collect();
+        let evals = EvaluationsList::new(vec![e0, e1, e2, e3]);
+        let weights = EvaluationsList::new(vec![w0, w1, w2, w3]);
 
-        // Create Small variant directly.
-        let small = ProductPolynomial::<F, EF>::new_small(
-            EvaluationsList::new(evals_vec.clone()),
-            EvaluationsList::new(weights_vec.clone()),
+        let mut poly = ProductPolynomial::<F, EF>::new_small(evals, weights);
+
+        // Initial sum = e0*w0 + e1*w1 + e2*w2 + e3*w3
+        let mut sum = e0 * w0 + e1 * w1 + e2 * w2 + e3 * w3;
+        assert_eq!(poly.dot_product(), sum);
+
+        // Perform one round of sumcheck.
+        let mut sumcheck_data = SumcheckData::default();
+        let mut challenger = make_challenger();
+
+        let _r = poly.round(&mut sumcheck_data, &mut challenger, &mut sum, 0);
+
+        // After round:
+        // 1. sum should be updated to h(r)
+        // 2. dot_product should equal the updated sum
+        assert_eq!(poly.dot_product(), sum);
+
+        // Verify sumcheck_data was populated with polynomial evaluations.
+        assert!(!sumcheck_data.polynomial_evaluations.is_empty());
+    }
+
+    #[test]
+    fn test_round_multiple_rounds() {
+        // Test multiple rounds of sumcheck to verify protocol consistency.
+        //
+        // After each round:
+        // - Number of variables decreases by 1
+        // - dot_product() == sum
+        let mut rng = SmallRng::seed_from_u64(123);
+        let num_vars = 4;
+        let num_evals = 1 << num_vars;
+
+        let evals: Vec<EF> = (0..num_evals).map(|_| EF::from_u64(rng.random())).collect();
+        let weights: Vec<EF> = (0..num_evals).map(|_| EF::from_u64(rng.random())).collect();
+
+        let mut poly = ProductPolynomial::<F, EF>::new_small(
+            EvaluationsList::new(evals),
+            EvaluationsList::new(weights),
         );
 
-        // The auto-selection might choose either variant depending on SIMD width.
-        let auto = ProductPolynomial::<F, EF>::new(
-            EvaluationsList::new(evals_vec),
-            EvaluationsList::new(weights_vec),
+        let mut sum = poly.dot_product();
+        let mut sumcheck_data = SumcheckData::default();
+        let mut challenger = make_challenger();
+
+        // Perform all rounds except the last (need at least 1 evaluation left).
+        for expected_vars in (1..=num_vars).rev() {
+            assert_eq!(poly.num_variables(), expected_vars);
+
+            let _ = poly.round(&mut sumcheck_data, &mut challenger, &mut sum, 0);
+
+            // Invariant: dot_product == sum after each round.
+            assert_eq!(poly.dot_product(), sum);
+        }
+
+        // After all rounds, should have 0 variables (1 evaluation).
+        assert_eq!(poly.num_variables(), 0);
+        assert_eq!(poly.num_evals(), 1);
+    }
+
+    #[test]
+    fn test_num_evals_small() {
+        // Test num_evals() for Small variant.
+        let evals = EvaluationsList::new(vec![EF::ONE; 16]);
+        let weights = EvaluationsList::new(vec![EF::TWO; 16]);
+
+        let poly = ProductPolynomial::<F, EF>::new_small(evals, weights);
+
+        assert_eq!(poly.num_evals(), 16);
+        assert_eq!(poly.num_variables(), 4); // log2(16) = 4
+    }
+
+    #[test]
+    fn test_num_evals_packed() {
+        // Test num_evals() for Packed variant.
+        type EP = <EF as ExtensionField<F>>::ExtensionPacking;
+
+        let simd_width = <F as Field>::Packing::WIDTH;
+        let num_vars = log2_strict_usize(simd_width) + 2;
+        let num_evals = 1 << num_vars;
+
+        let evals_scalar: Vec<EF> = (0..num_evals).map(|i| EF::from_u64(i as u64)).collect();
+        let weights_scalar: Vec<EF> = (0..num_evals)
+            .map(|i| EF::from_u64(i as u64 + 100))
+            .collect();
+
+        let packed_evals = EvaluationsList::new(
+            evals_scalar
+                .chunks(simd_width)
+                .map(EP::from_ext_slice)
+                .collect(),
+        );
+        let packed_weights = EvaluationsList::new(
+            weights_scalar
+                .chunks(simd_width)
+                .map(EP::from_ext_slice)
+                .collect(),
         );
 
-        // Both should have the same num_variables.
-        assert_eq!(small.num_variables(), auto.num_variables());
+        let poly = ProductPolynomial::<F, EF>::new_packed(packed_evals, packed_weights);
 
-        // Both should have the same num_evals.
-        assert_eq!(small.num_evals(), auto.num_evals());
+        assert_eq!(poly.num_evals(), num_evals);
+        assert_eq!(poly.num_variables(), num_vars);
+    }
 
-        // Both should have the same dot_product.
-        assert_eq!(small.dot_product(), auto.dot_product());
+    #[test]
+    fn test_dot_product_packed_matches_scalar() {
+        // Verify that Packed and Small variants compute the same dot product.
+        type EP = <EF as ExtensionField<F>>::ExtensionPacking;
 
-        // Both should evaluate to the same value at the same point.
-        let point = MultilinearPoint::new(vec![EF::from_u64(3); 4]);
-        assert_eq!(small.eval(&point), auto.eval(&point));
+        let simd_width = <F as Field>::Packing::WIDTH;
+        let num_vars = log2_strict_usize(simd_width) + 1;
+        let num_evals = 1 << num_vars;
 
-        // Both should extract the same evals.
-        assert_eq!(small.evals().as_slice(), auto.evals().as_slice());
+        let mut rng = SmallRng::seed_from_u64(456);
+        let evals_scalar: Vec<EF> = (0..num_evals).map(|_| EF::from_u64(rng.random())).collect();
+        let weights_scalar: Vec<EF> = (0..num_evals).map(|_| EF::from_u64(rng.random())).collect();
+
+        // Compute expected dot product manually.
+        let expected: EF = evals_scalar
+            .iter()
+            .zip(weights_scalar.iter())
+            .map(|(&e, &w)| e * w)
+            .sum();
+
+        // Create Small variant and verify.
+        let small_poly = ProductPolynomial::<F, EF>::new_small(
+            EvaluationsList::new(evals_scalar.clone()),
+            EvaluationsList::new(weights_scalar.clone()),
+        );
+        assert_eq!(small_poly.dot_product(), expected);
+
+        // Create Packed variant and verify.
+        let packed_evals = EvaluationsList::new(
+            evals_scalar
+                .chunks(simd_width)
+                .map(EP::from_ext_slice)
+                .collect(),
+        );
+        let packed_weights = EvaluationsList::new(
+            weights_scalar
+                .chunks(simd_width)
+                .map(EP::from_ext_slice)
+                .collect(),
+        );
+
+        let packed_poly = ProductPolynomial::<F, EF>::new_packed(packed_evals, packed_weights);
+        assert_eq!(packed_poly.dot_product(), expected);
+    }
+
+    #[test]
+    fn test_evals_extraction() {
+        // Test that evals() returns correct values for both variants.
+        let e0 = EF::from_u64(10);
+        let e1 = EF::from_u64(20);
+        let e2 = EF::from_u64(30);
+        let e3 = EF::from_u64(40);
+
+        let evals = EvaluationsList::new(vec![e0, e1, e2, e3]);
+        let weights = EvaluationsList::new(vec![EF::ONE; 4]);
+
+        let poly = ProductPolynomial::<F, EF>::new_small(evals, weights);
+
+        let extracted = poly.evals();
+        assert_eq!(extracted.as_slice(), &[e0, e1, e2, e3]);
+    }
+
+    #[test]
+    fn test_combine_updates_weights_and_sum() {
+        // Test that combine() correctly incorporates new constraints.
+        //
+        // The combine function should:
+        // 1. Update the weight polynomial with new constraint contributions
+        // 2. Update the running sum accordingly
+        use crate::whir::constraints::{Constraint, statement::EqStatement};
+
+        let num_vars = 2;
+        let evals = EvaluationsList::new(vec![EF::ONE; 4]);
+        let weights = EvaluationsList::new(vec![EF::ONE; 4]);
+
+        let mut poly = ProductPolynomial::<F, EF>::new_small(evals.clone(), weights);
+
+        // Initial state: dot_product = 4 (all ones)
+        let initial_dot = poly.dot_product();
+        assert_eq!(initial_dot, EF::from_u64(4));
+
+        // Create an EqStatement with one constraint.
+        let mut eq_statement = EqStatement::initialize(num_vars);
+        let point = MultilinearPoint::new(vec![EF::from_u64(2), EF::from_u64(3)]);
+        let eval = evals.evaluate_hypercube_ext::<EF>(&point);
+        eq_statement.add_evaluated_constraint(point, eval);
+
+        // Create constraint with the eq_statement.
+        let challenge = EF::from_u64(7);
+        let constraint = Constraint::<F, EF>::new_eq_only(challenge, eq_statement);
+
+        let mut sum = poly.dot_product();
+        poly.combine(&mut sum, &constraint);
+
+        // After combining, the weights may have changed.
+        // The exact behavior depends on the constraint implementation.
+        // We verify the invariant: dot_product reflects the combined state.
+        assert_eq!(poly.dot_product(), sum);
+    }
+
+    #[test]
+    fn test_eval_at_boolean_points() {
+        // Test eval() at boolean points (0 and 1 coordinates).
+        //
+        // For multilinear polynomial over boolean hypercube,
+        // eval at boolean point should return the stored evaluation.
+        let e00 = EF::from_u64(1);
+        let e01 = EF::from_u64(2);
+        let e10 = EF::from_u64(3);
+        let e11 = EF::from_u64(4);
+
+        let evals = EvaluationsList::new(vec![e00, e01, e10, e11]);
+        let weights = EvaluationsList::new(vec![EF::ONE; 4]);
+
+        let poly = ProductPolynomial::<F, EF>::new_small(evals, weights);
+
+        // Evaluate at (0, 0) -> should return e00
+        let point_00 = MultilinearPoint::new(vec![EF::ZERO, EF::ZERO]);
+        assert_eq!(poly.eval(&point_00), e00);
+
+        // Evaluate at (0, 1) -> should return e01
+        let point_01 = MultilinearPoint::new(vec![EF::ZERO, EF::ONE]);
+        assert_eq!(poly.eval(&point_01), e01);
+
+        // Evaluate at (1, 0) -> should return e10
+        let point_10 = MultilinearPoint::new(vec![EF::ONE, EF::ZERO]);
+        assert_eq!(poly.eval(&point_10), e10);
+
+        // Evaluate at (1, 1) -> should return e11
+        let point_11 = MultilinearPoint::new(vec![EF::ONE, EF::ONE]);
+        assert_eq!(poly.eval(&point_11), e11);
+    }
+
+    proptest! {
+        /// Verify that dot_product is consistent across random inputs.
+        #[test]
+        fn prop_dot_product_consistency(seed in 0u64..1000) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let num_vars = 3;
+            let num_evals = 1 << num_vars;
+
+            let evals: Vec<EF> = (0..num_evals)
+                .map(|_| EF::from_u64(u64::from(rng.random::<u32>())))
+                .collect();
+            let weights: Vec<EF> = (0..num_evals)
+                .map(|_| EF::from_u64(u64::from(rng.random::<u32>())))
+                .collect();
+
+            let poly = ProductPolynomial::<F, EF>::new_small(
+                EvaluationsList::new(evals.clone()),
+                EvaluationsList::new(weights.clone()),
+            );
+
+            // Manual computation
+            let expected: EF = evals
+                .iter()
+                .zip(weights.iter())
+                .map(|(&e, &w)| e * w)
+                .sum();
+
+            prop_assert_eq!(poly.dot_product(), expected);
+        }
+
+        /// Verify that compress maintains the sumcheck invariant.
+        #[test]
+        fn prop_compress_maintains_invariant(seed in 0u64..1000, challenge_val in 1u64..100) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let num_vars = 3;
+            let num_evals = 1 << num_vars;
+
+            let evals: Vec<EF> = (0..num_evals)
+                .map(|_| EF::from_u64(u64::from(rng.random::<u32>())))
+                .collect();
+            let weights: Vec<EF> = (0..num_evals)
+                .map(|_| EF::from_u64(u64::from(rng.random::<u32>())))
+                .collect();
+
+            let mut poly = ProductPolynomial::<F, EF>::new_small(
+                EvaluationsList::new(evals),
+                EvaluationsList::new(weights),
+            );
+
+            // Compute sumcheck coefficients before folding.
+            // sumcheck_coefficients returns (h(0), h(2)) where h is the univariate
+            // polynomial h(X) = sum_{b in {0,1}^{n-1}} f(X, b) * w(X, b).
+            let (c0, c2) = match &poly {
+                ProductPolynomial::Small {
+                    evals: small_evals,
+                    weights: small_weights,
+                } => small_evals.sumcheck_coefficients(small_weights),
+                ProductPolynomial::Packed { .. } => unreachable!(),
+            };
+
+            // The sumcheck relation: h(0) + h(1) = claimed_sum
+            // So h(1) = claimed_sum - h(0) = claimed_sum - c0
+            let initial_sum = poly.dot_product();
+            let h_1 = initial_sum - c0;
+
+            // Fold with challenge r.
+            let r = EF::from_u64(challenge_val);
+            poly.compress(r);
+
+            // Use Lagrange interpolation to compute h(r) from h(0), h(1), h(2).
+            // h(r) = extrapolate_012(c0, h_1, c2, r)
+            let h_r = extrapolate_012(c0, h_1, c2, r);
+
+            // After folding, dot_product should equal h(r).
+            prop_assert_eq!(poly.dot_product(), h_r);
+        }
+
+        /// Verify that round() maintains the sumcheck invariant.
+        #[test]
+        fn prop_round_maintains_invariant(seed in 0u64..1000) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let num_vars = 4;
+            let num_evals = 1 << num_vars;
+
+            let evals: Vec<EF> = (0..num_evals)
+                .map(|_| EF::from_u64(u64::from(rng.random::<u32>())))
+                .collect();
+            let weights: Vec<EF> = (0..num_evals)
+                .map(|_| EF::from_u64(u64::from(rng.random::<u32>())))
+                .collect();
+
+            let mut poly = ProductPolynomial::<F, EF>::new_small(
+                EvaluationsList::new(evals),
+                EvaluationsList::new(weights),
+            );
+
+            let mut sum = poly.dot_product();
+            let mut sumcheck_data = SumcheckData::default();
+
+            // Use seed to create challenger for reproducibility.
+            let perm = Perm::new_from_rng_128(&mut SmallRng::seed_from_u64(seed + 1000));
+            let mut challenger: TestChallenger = DuplexChallenger::new(perm);
+
+            // Perform one round.
+            let _ = poly.round(&mut sumcheck_data, &mut challenger, &mut sum, 0);
+
+            // Invariant: dot_product == sum after round.
+            prop_assert_eq!(poly.dot_product(), sum);
+        }
     }
 }

@@ -1,15 +1,13 @@
 use std::time::Instant;
 
 use clap::Parser;
-use p3_baby_bear::BabyBear;
 use p3_challenger::DuplexChallenger;
 use p3_dft::Radix2DFTSmallBatch;
 use p3_field::{Field, extension::BinomialExtensionField};
-use p3_goldilocks::Goldilocks;
 use p3_koala_bear::{KoalaBear, Poseidon2KoalaBear};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use rand::{
-    Rng, SeedableRng,
+    RngExt, SeedableRng,
     rngs::{SmallRng, StdRng},
 };
 use tracing_forest::{ForestLayer, util::LevelFilter};
@@ -20,8 +18,7 @@ use whir_p3::{
     poly::{evals::EvaluationsList, multilinear::MultilinearPoint},
     whir::{
         committer::{reader::CommitmentReader, writer::CommitmentWriter},
-        constraints::statement::EqStatement,
-        parameters::{InitialPhaseConfig, WhirConfig},
+        parameters::{SumcheckStrategy, WhirConfig},
         proof::WhirProof,
         prover::Prover,
         verifier::Verifier,
@@ -30,10 +27,6 @@ use whir_p3::{
 
 type F = KoalaBear;
 type EF = BinomialExtensionField<F, 4>;
-type _F = BabyBear;
-type _EF = BinomialExtensionField<_F, 5>;
-type __F = Goldilocks;
-type __EF = BinomialExtensionField<__F, 2>;
 
 type Poseidon16 = Poseidon2KoalaBear<16>;
 type Poseidon24 = Poseidon2KoalaBear<24>;
@@ -114,7 +107,6 @@ fn main() {
 
     // Construct WHIR protocol parameters
     let whir_params = ProtocolParameters {
-        initial_phase_config: InitialPhaseConfig::WithStatementClassic,
         security_level,
         pow_bits,
         folding_factor,
@@ -132,19 +124,15 @@ fn main() {
 
     let mut rng = StdRng::seed_from_u64(0);
     let polynomial = EvaluationsList::<F>::new((0..num_coeffs).map(|_| rng.random()).collect());
+    let mut initial_statement = params.initial_statement(polynomial, SumcheckStrategy::default());
 
     // Sample `num_points` random multilinear points in the Boolean hypercube
-    let points: Vec<_> = (0..num_evaluations)
-        .map(|_| MultilinearPoint::rand(&mut rng, num_variables))
-        .collect();
+    // And add constraints for each sampled point (equality constraints)
+    (0..num_evaluations).for_each(|_| {
+        let _ = initial_statement.evaluate(&MultilinearPoint::rand(&mut rng, num_variables));
+    });
 
-    // Construct a new statement with the correct number of variables
-    let mut statement = EqStatement::<EF>::initialize(num_variables);
-
-    // Add constraints for each sampled point (equality constraints)
-    for point in &points {
-        statement.add_unevaluated_constraint_hypercube(point.clone(), &polynomial);
-    }
+    let verifier_statement = initial_statement.normalize();
 
     // Define the Fiat-Shamir domain separator pattern for committing and proving
     let mut domainsep = DomainSeparator::new(vec![]);
@@ -171,12 +159,12 @@ fn main() {
     let mut proof = WhirProof::<F, EF, F, 8>::from_protocol_parameters(&whir_params, num_variables);
 
     let time = Instant::now();
-    let witness = committer
+    let prover_data = committer
         .commit::<_, <F as Field>::Packing, F, <F as Field>::Packing, 8>(
             &dft,
             &mut proof,
             &mut prover_challenger,
-            polynomial,
+            &mut initial_statement,
         )
         .unwrap();
     let commit_time = time.elapsed();
@@ -191,8 +179,8 @@ fn main() {
             &dft,
             &mut proof,
             &mut prover_challenger,
-            statement.clone(),
-            witness,
+            &initial_statement,
+            prover_data,
         )
         .unwrap();
 
@@ -218,7 +206,7 @@ fn main() {
             &proof,
             &mut verifier_challenger,
             &parsed_commitment,
-            statement,
+            verifier_statement,
         )
         .unwrap();
     let verify_time = verif_time.elapsed();

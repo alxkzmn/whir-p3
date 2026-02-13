@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
 #[cfg(test)]
 use alloc::format;
+use alloc::vec::Vec;
 
 use itertools::Itertools;
 use p3_field::{
@@ -534,7 +534,7 @@ mod tests {
         PackedFieldExtension, PrimeCharacteristicRing, extension::BinomialExtensionField,
     };
     use proptest::prelude::*;
-    use rand::{Rng, SeedableRng, rngs::SmallRng};
+    use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
     use super::*;
 
