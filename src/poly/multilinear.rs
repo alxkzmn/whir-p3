@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
 #[cfg(test)]
 use alloc::format;
+use alloc::vec::Vec;
 use core::{
     ops::{Index, RangeBounds},
     slice::SliceIndex,
