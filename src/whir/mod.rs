@@ -1,5 +1,6 @@
 pub mod committer;
 pub mod constraints;
+pub mod merkle_multiproof;
 pub mod parameters;
 pub mod proof;
 pub mod prover;

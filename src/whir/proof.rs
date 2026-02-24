@@ -5,7 +5,10 @@ use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{ExtensionField, Field};
 use serde::{Deserialize, Serialize};
 
-use crate::{parameters::ProtocolParameters, poly::evals::EvaluationsList};
+use crate::{
+    parameters::ProtocolParameters, poly::evals::EvaluationsList,
+    whir::merkle_multiproof::MerkleMultiProof,
+};
 
 /// Complete WHIR proof
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -33,8 +36,10 @@ pub struct WhirProof<F, EF, W, const DIGEST_ELEMS: usize> {
     /// Final round PoW witness
     pub final_pow_witness: F,
 
-    /// Final round query openings
-    pub final_queries: Vec<QueryOpening<F, EF, W, DIGEST_ELEMS>>,
+    /// Final round batched query opening.
+    ///
+    /// `None` means the proof has not been populated yet.
+    pub final_query_batch: Option<QueryBatchOpening<F, EF, W, DIGEST_ELEMS>>,
 
     /// Final sumcheck (if final_sumcheck_rounds > 0)
     pub final_sumcheck: Option<SumcheckData<F, EF>>,
@@ -51,7 +56,7 @@ impl<F: Default, EF: Default, W: Default, const DIGEST_ELEMS: usize> Default
             rounds: Vec::new(),
             final_poly: None,
             final_pow_witness: F::default(),
-            final_queries: Vec::new(),
+            final_query_batch: None,
             final_sumcheck: None,
         }
     }
@@ -75,8 +80,10 @@ pub struct WhirRoundProof<F, EF, W, const DIGEST_ELEMS: usize> {
     /// PoW witness after commitment
     pub pow_witness: F,
 
-    /// STIR query openings
-    pub queries: Vec<QueryOpening<F, EF, W, DIGEST_ELEMS>>,
+    /// STIR batched query opening.
+    ///
+    /// `None` means the proof has not been populated yet.
+    pub query_batch: Option<QueryBatchOpening<F, EF, W, DIGEST_ELEMS>>,
 
     /// Sumcheck data for this round
     pub sumcheck: SumcheckData<F, EF>,
@@ -90,13 +97,13 @@ impl<F: Default, EF: Default, W: Default, const DIGEST_ELEMS: usize> Default
             commitment: array::from_fn(|_| W::default()),
             ood_answers: Vec::new(),
             pow_witness: F::default(),
-            queries: Vec::new(),
+            query_batch: None,
             sumcheck: SumcheckData::default(),
         }
     }
 }
 
-/// Query opening
+/// Batched query opening.
 ///
 /// The type parameter `W` is the digest element type (same as in `WhirProof`)
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -107,22 +114,22 @@ impl<F: Default, EF: Default, W: Default, const DIGEST_ELEMS: usize> Default
     ),
     tag = "type"
 )]
-pub enum QueryOpening<F, EF, W, const DIGEST_ELEMS: usize> {
+pub enum QueryBatchOpening<F, EF, W, const DIGEST_ELEMS: usize> {
     /// Base field query (round_index == 0)
     #[serde(rename = "base")]
     Base {
-        /// Merkle leaf values in F
-        values: Vec<F>,
-        /// Merkle authentication path
-        proof: Vec<[W; DIGEST_ELEMS]>,
+        /// Merkle leaf values in F for each queried index.
+        values: Vec<Vec<F>>,
+        /// Deduplicated Merkle multiproof for all queried indices.
+        proof: MerkleMultiProof<W, DIGEST_ELEMS>,
     },
     /// Extension field query (round_index > 0)
     #[serde(rename = "extension")]
     Extension {
-        /// Merkle leaf values in EF
-        values: Vec<EF>,
-        /// Merkle authentication path
-        proof: Vec<[W; DIGEST_ELEMS]>,
+        /// Merkle leaf values in EF for each queried index.
+        values: Vec<Vec<EF>>,
+        /// Deduplicated Merkle multiproof for all queried indices.
+        proof: MerkleMultiProof<W, DIGEST_ELEMS>,
     },
 }
 
@@ -238,7 +245,12 @@ impl<F: Default, EF: Default, W: Default, const DIGEST_ELEMS: usize>
             rounds: (0..num_rounds).map(|_| WhirRoundProof::default()).collect(),
             final_poly: None,
             final_pow_witness: F::default(),
-            final_queries: Vec::with_capacity(num_queries),
+            final_query_batch: Some(QueryBatchOpening::Base {
+                values: Vec::with_capacity(num_queries),
+                proof: MerkleMultiProof {
+                    decommitments: Vec::new(),
+                },
+            }),
             final_sumcheck: None,
         }
     }
@@ -413,12 +425,12 @@ mod tests {
                 commitment: array::from_fn(|_| F::default()),
                 ood_answers: Vec::new(),
                 pow_witness: pow_witness_value,
-                queries: Vec::new(),
+                query_batch: None,
                 sumcheck: SumcheckData::default(),
             }],
             final_poly: None,
             final_pow_witness: F::default(),
-            final_queries: Vec::new(),
+            final_query_batch: None,
             final_sumcheck: None,
         };
 
@@ -443,12 +455,12 @@ mod tests {
                 commitment: array::from_fn(|_| F::default()),
                 ood_answers: Vec::new(),
                 pow_witness: F::from_u64(42),
-                queries: Vec::new(),
+                query_batch: None,
                 sumcheck: SumcheckData::default(),
             }],
             final_poly: None,
             final_pow_witness: F::default(),
-            final_queries: Vec::new(),
+            final_query_batch: None,
             final_sumcheck: None,
         };
 
@@ -479,8 +491,8 @@ mod tests {
         // Verify pow_witness is default
         assert_eq!(round.pow_witness, F::default());
 
-        // Verify queries is empty
-        assert_eq!(round.queries.len(), 0);
+        // Verify query batch is not populated by default.
+        assert!(round.query_batch.is_none());
 
         // Verify sumcheck has default values
         assert_eq!(round.sumcheck.polynomial_evaluations.len(), 0);
@@ -500,64 +512,64 @@ mod tests {
     }
 
     #[test]
-    fn test_query_opening_variants() {
+    fn test_query_batch_opening_variants() {
         // Test Base variant
 
-        // Create base field values
-        let base_val_0 = F::from_u64(1);
-        let base_val_1 = F::from_u64(2);
-        let values = vec![base_val_0, base_val_1];
+        // Create base field row values.
+        let values = vec![vec![F::from_u64(1), F::from_u64(2)]];
 
-        // Create Merkle proof (authentication path)
+        // Create a multiproof.
         let proof_node = array::from_fn(|i| F::from_u64(i as u64));
-        let proof = vec![proof_node];
+        let proof = MerkleMultiProof {
+            decommitments: vec![proof_node],
+        };
 
         // Construct Base variant
-        let base_opening: QueryOpening<F, EF, F, DIGEST_ELEMS> = QueryOpening::Base {
+        let base_opening: QueryBatchOpening<F, EF, F, DIGEST_ELEMS> = QueryBatchOpening::Base {
             values,
             proof: proof.clone(),
         };
 
         // Verify it's the correct variant
         match base_opening {
-            QueryOpening::Base {
+            QueryBatchOpening::Base {
                 values: v,
                 proof: p,
             } => {
-                assert_eq!(v.len(), 2);
-                assert_eq!(v[0], base_val_0);
-                assert_eq!(v[1], base_val_1);
-                assert_eq!(p.len(), 1);
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].len(), 2);
+                assert_eq!(v[0][0], F::from_u64(1));
+                assert_eq!(v[0][1], F::from_u64(2));
+                assert_eq!(p.decommitments.len(), 1);
             }
-            QueryOpening::Extension { .. } => panic!("Expected Base variant"),
+            QueryBatchOpening::Extension { .. } => panic!("Expected Base variant"),
         }
 
         // Test Extension variant
 
         // Create extension field values
         // Extension field values are created from base field using From trait
-        let ext_val_0 = EF::from_u64(3);
-        let ext_val_1 = EF::from_u64(4);
-        let ext_values = vec![ext_val_0, ext_val_1];
+        let ext_values = vec![vec![EF::from_u64(3), EF::from_u64(4)]];
 
         // Construct Extension variant
-        let ext_opening: QueryOpening<F, EF, F, DIGEST_ELEMS> = QueryOpening::Extension {
+        let ext_opening: QueryBatchOpening<F, EF, F, DIGEST_ELEMS> = QueryBatchOpening::Extension {
             values: ext_values,
             proof,
         };
 
         // Verify it's the correct variant
         match ext_opening {
-            QueryOpening::Extension {
+            QueryBatchOpening::Extension {
                 values: v,
                 proof: p,
             } => {
-                assert_eq!(v.len(), 2);
-                assert_eq!(v[0], ext_val_0);
-                assert_eq!(v[1], ext_val_1);
-                assert_eq!(p.len(), 1);
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].len(), 2);
+                assert_eq!(v[0][0], EF::from_u64(3));
+                assert_eq!(v[0][1], EF::from_u64(4));
+                assert_eq!(p.decommitments.len(), 1);
             }
-            QueryOpening::Base { .. } => panic!("Expected Extension variant"),
+            QueryBatchOpening::Base { .. } => panic!("Expected Extension variant"),
         }
     }
 
@@ -590,7 +602,7 @@ mod tests {
             rounds: Vec::new(),
             final_poly: None,
             final_pow_witness: F::default(),
-            final_queries: Vec::new(),
+            final_query_batch: None,
             final_sumcheck: None,
         };
 
@@ -620,7 +632,7 @@ mod tests {
             rounds: vec![WhirRoundProof::default(), WhirRoundProof::default()],
             final_poly: None,
             final_pow_witness: F::default(),
-            final_queries: Vec::new(),
+            final_query_batch: None,
             final_sumcheck: None,
         };
 
@@ -657,7 +669,7 @@ mod tests {
             rounds: Vec::new(),
             final_poly: None,
             final_pow_witness: F::default(),
-            final_queries: Vec::new(),
+            final_query_batch: None,
             final_sumcheck: None,
         };
 
