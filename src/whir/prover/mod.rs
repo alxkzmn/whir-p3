@@ -301,6 +301,9 @@ where
             None => {
                 let mut answers: Vec<Vec<F>> = Vec::with_capacity(stir_challenges_indexes.len());
                 let mut opening_paths = Vec::with_capacity(stir_challenges_indexes.len());
+                // TODO(multiproof): Replace per-query `open_batch` extraction with a multi-open
+                // path API (or layer access) so we avoid repeated tree traversals and reduce
+                // prover CPU/RAM overhead without changing proof semantics.
                 for challenge in &stir_challenges_indexes {
                     let commitment =
                         mmcs.open_batch(*challenge, &round_state.commitment_merkle_prover_data);
@@ -337,6 +340,9 @@ where
             Some(data) => {
                 let mut answers: Vec<Vec<EF>> = Vec::with_capacity(stir_challenges_indexes.len());
                 let mut opening_paths = Vec::with_capacity(stir_challenges_indexes.len());
+                // TODO(multiproof): Replace per-query `open_batch` extraction with a multi-open
+                // path API (or layer access) so we avoid repeated tree traversals and reduce
+                // prover CPU/RAM overhead without changing proof semantics.
                 for challenge in &stir_challenges_indexes {
                     let commitment = extension_mmcs.open_batch(*challenge, data);
                     answers.push(commitment.opened_values[0].clone());
@@ -453,6 +459,9 @@ where
             None => {
                 let mut values = Vec::with_capacity(final_challenge_indexes.len());
                 let mut opening_paths = Vec::with_capacity(final_challenge_indexes.len());
+                // TODO(multiproof): Replace per-query `open_batch` extraction with a multi-open
+                // path API (or layer access) so we avoid repeated tree traversals and reduce
+                // prover CPU/RAM overhead without changing proof semantics.
                 for &challenge in &final_challenge_indexes {
                     let commitment =
                         mmcs.open_batch(challenge, &round_state.commitment_merkle_prover_data);
@@ -474,6 +483,9 @@ where
             Some(data) => {
                 let mut values = Vec::with_capacity(final_challenge_indexes.len());
                 let mut opening_paths = Vec::with_capacity(final_challenge_indexes.len());
+                // TODO(multiproof): Replace per-query `open_batch` extraction with a multi-open
+                // path API (or layer access) so we avoid repeated tree traversals and reduce
+                // prover CPU/RAM overhead without changing proof semantics.
                 for &challenge in &final_challenge_indexes {
                     let commitment = extension_mmcs.open_batch(challenge, data);
                     values.push(commitment.opened_values[0].clone());
