@@ -5,6 +5,8 @@ use p3_field::{ExtensionField, Field};
 use p3_symmetric::CryptographicHasher;
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::{add_leaf_hash_call, add_node_hash_call};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "W: Serialize, [W; DIGEST_ELEMS]: Serialize",
@@ -179,6 +181,7 @@ where
             {
                 let sibling_hash = frontier[cursor + 1].1;
                 cursor += 2;
+                add_node_hash_call();
                 compress([hash, sibling_hash])
             } else {
                 let Some(sibling_hash) = decommitments.get(decommitment_cursor).copied() else {
@@ -191,8 +194,10 @@ where
                 cursor += 1;
 
                 if node & 1 == 0 {
+                    add_node_hash_call();
                     compress([hash, sibling_hash])
                 } else {
+                    add_node_hash_call();
                     compress([sibling_hash, hash])
                 }
             };
@@ -230,6 +235,7 @@ where
     H: CryptographicHasher<F, [W; DIGEST_ELEMS]>,
     F: Copy,
 {
+    add_leaf_hash_call();
     hasher.hash_iter(values.iter().copied())
 }
 
@@ -243,6 +249,7 @@ where
     F: Field,
     EF: ExtensionField<F>,
 {
+    add_leaf_hash_call();
     hasher.hash_iter(
         values
             .iter()
