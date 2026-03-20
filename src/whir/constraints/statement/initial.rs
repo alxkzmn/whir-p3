@@ -123,6 +123,26 @@ impl<F: Field, EF: ExtensionField<F>> InitialStatement<F, EF> {
         }
     }
 
+    /// Creates a classic initial statement from an already-built equality statement.
+    ///
+    /// This is primarily intended for integrations that build custom linear/tensor
+    /// constraints externally and need to pass them through the initial prover API.
+    #[must_use]
+    pub fn from_eq_statement(poly: EvaluationsList<F>, statement: EqStatement<EF>) -> Self {
+        assert_eq!(
+            poly.num_variables(),
+            statement.num_variables(),
+            "Statement has {} variables but polynomial has {}",
+            statement.num_variables(),
+            poly.num_variables()
+        );
+
+        Self {
+            poly,
+            inner: InitialStatementInner::Classic(statement),
+        }
+    }
+
     /// Evaluates the polynomial at the given point and records the constraint.
     ///
     /// Steps:

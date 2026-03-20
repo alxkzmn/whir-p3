@@ -134,7 +134,8 @@ fn eval_eq_with_skip<EF: TwoAdicField>(
     let r_skip = *eval_point
         .last_variable()
         .expect("skip challenge must be present");
-    let r_rest = MultilinearPoint::new(eval_point.as_slice()[..eval_point.num_variables() - 1].to_vec());
+    let r_rest =
+        MultilinearPoint::new(eval_point.as_slice()[..eval_point.num_variables() - 1].to_vec());
 
     let subgroup_eq = eq_d(r_skip, z_skip, 1usize << k_skip);
     let hypercube_eq = z_rest.eq_poly(&r_rest);
