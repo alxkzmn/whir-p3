@@ -1,13 +1,12 @@
 use alloc::{format, vec, vec::Vec};
-use core::{fmt::Debug, ops::Deref, slice::from_ref};
+use core::{fmt::Debug, ops::Deref};
 
 use errors::VerifierError;
 use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
-use p3_commit::{BatchOpeningRef, ExtensionMmcs, Mmcs};
 use p3_field::{ExtensionField, Field, PackedValue, TwoAdicField};
 use p3_matrix::Dimensions;
-use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::{CryptographicHasher, Hash, PseudoCompressionFunction};
+use p3_util::log2_ceil_usize;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -23,8 +22,9 @@ use crate::{
             evaluator::ConstraintPolyEvaluator,
             statement::{EqStatement, SelectStatement},
         },
+        merkle_multiproof::{compute_root_from_multiproof, hash_leaf_base, hash_leaf_extension},
         parameters::WhirConfig,
-        proof::{QueryOpening, WhirProof},
+        proof::{QueryBatchOpening, WhirProof},
         verifier::sumcheck::{verify_final_sumcheck_rounds, verify_sumcheck_rounds},
     },
 };
@@ -247,7 +247,7 @@ where
     ) -> Result<SelectStatement<F, EF>, VerifierError>
     where
         P: PackedValue<Value = F> + Eq + Send + Sync,
-        W: PackedValue<Value = W> + Eq + Send + Sync,
+        W: PackedValue<Value = W> + Eq + Send + Sync + Copy,
         PW: PackedValue<Value = W> + Eq + Send + Sync,
         H: CryptographicHasher<F, [W; DIGEST_ELEMS]>
             + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
@@ -360,7 +360,7 @@ where
     ) -> Result<Vec<Vec<EF>>, VerifierError>
     where
         P: PackedValue<Value = F> + Eq + Send + Sync,
-        W: PackedValue<Value = W> + Eq + Send + Sync,
+        W: PackedValue<Value = W> + Eq + Send + Sync + Copy,
         PW: PackedValue<Value = W> + Eq + Send + Sync,
         H: CryptographicHasher<F, [W; DIGEST_ELEMS]>
             + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
@@ -370,70 +370,130 @@ where
             + Sync,
         [W; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
     {
-        let mmcs: MerkleTreeMmcs<P, PW, H, C, DIGEST_ELEMS> =
-            MerkleTreeMmcs::new(self.merkle_hash.clone(), self.merkle_compress.clone());
-        let extension_mmcs = ExtensionMmcs::new(mmcs.clone());
-
-        // Determine which queries to use from the proof structure
-        let queries = if round_index == self.n_rounds() {
-            &proof.final_queries
+        // Determine which query batch to use from the proof structure.
+        let query_batch = if round_index == self.n_rounds() {
+            proof
+                .final_query_batch
+                .as_ref()
+                .ok_or_else(|| VerifierError::MerkleProofInvalid {
+                    position: 0,
+                    reason: "Missing final query batch".to_string(),
+                })?
         } else {
-            &proof
+            proof
                 .rounds
                 .get(round_index)
                 .ok_or_else(|| VerifierError::MerkleProofInvalid {
                     position: 0,
                     reason: format!("Round {round_index} not found in proof"),
                 })?
-                .queries
+                .query_batch
+                .as_ref()
+                .ok_or_else(|| VerifierError::MerkleProofInvalid {
+                    position: 0,
+                    reason: format!("Missing query batch for round {round_index}"),
+                })?
         };
 
-        let mut results = Vec::with_capacity(indices.len());
+        let Some(max_height) = dimensions.iter().map(|dim| dim.height).max() else {
+            return Err(VerifierError::MerkleProofInvalid {
+                position: 0,
+                reason: "Empty matrix dimensions".to_string(),
+            });
+        };
+        let depth = log2_ceil_usize(max_height);
 
-        for (&index, query) in indices.iter().zip(queries.iter()) {
-            let values_ef = match query {
-                QueryOpening::Base { values, proof } => {
-                    mmcs.verify_batch(
-                        root,
-                        dimensions,
-                        index,
-                        BatchOpeningRef {
-                            opened_values: from_ref(values),
-                            opening_proof: proof,
-                        },
-                    )
-                    .map_err(|_| VerifierError::MerkleProofInvalid {
-                        position: index,
-                        reason: "Base field Merkle proof verification failed".to_string(),
-                    })?;
+        let expected_root = *root.as_ref();
 
-                    // Convert F -> EF
-                    values.iter().map(|&f| f.into()).collect()
+        match query_batch {
+            QueryBatchOpening::Base {
+                values,
+                proof: multiproof,
+            } => {
+                if values.len() != indices.len() {
+                    return Err(VerifierError::MerkleProofInvalid {
+                        position: 0,
+                        reason: format!(
+                            "Wrong number of base openings: expected {}, got {}",
+                            indices.len(),
+                            values.len()
+                        ),
+                    });
                 }
-                QueryOpening::Extension { values, proof } => {
-                    extension_mmcs
-                        .verify_batch(
-                            root,
-                            dimensions,
-                            index,
-                            BatchOpeningRef {
-                                opened_values: from_ref(values),
-                                opening_proof: proof,
-                            },
-                        )
-                        .map_err(|_| VerifierError::MerkleProofInvalid {
-                            position: index,
-                            reason: "Extension field Merkle proof verification failed".to_string(),
-                        })?;
 
-                    values.clone()
+                let leaf_hashes: Vec<[W; DIGEST_ELEMS]> = values
+                    .iter()
+                    .map(|row| hash_leaf_base::<F, W, H, DIGEST_ELEMS>(&self.merkle_hash, row))
+                    .collect();
+
+                let computed_root = compute_root_from_multiproof(
+                    indices,
+                    &leaf_hashes,
+                    depth,
+                    &multiproof.decommitments,
+                    |pair| self.merkle_compress.compress(pair),
+                )
+                .map_err(|err| VerifierError::MerkleProofInvalid {
+                    position: 0,
+                    reason: format!("Invalid base-field multiproof: {err:?}"),
+                })?;
+
+                if computed_root != expected_root {
+                    return Err(VerifierError::MerkleProofInvalid {
+                        position: 0,
+                        reason: "Base field Merkle multiproof root mismatch".to_string(),
+                    });
                 }
-            };
 
-            results.push(values_ef);
+                Ok(values
+                    .iter()
+                    .map(|row| row.iter().map(|&f| f.into()).collect())
+                    .collect())
+            }
+            QueryBatchOpening::Extension {
+                values,
+                proof: multiproof,
+            } => {
+                if values.len() != indices.len() {
+                    return Err(VerifierError::MerkleProofInvalid {
+                        position: 0,
+                        reason: format!(
+                            "Wrong number of extension openings: expected {}, got {}",
+                            indices.len(),
+                            values.len()
+                        ),
+                    });
+                }
+
+                let leaf_hashes: Vec<[W; DIGEST_ELEMS]> = values
+                    .iter()
+                    .map(|row| {
+                        hash_leaf_extension::<F, EF, W, H, DIGEST_ELEMS>(&self.merkle_hash, row)
+                    })
+                    .collect();
+
+                let computed_root = compute_root_from_multiproof(
+                    indices,
+                    &leaf_hashes,
+                    depth,
+                    &multiproof.decommitments,
+                    |pair| self.merkle_compress.compress(pair),
+                )
+                .map_err(|err| VerifierError::MerkleProofInvalid {
+                    position: 0,
+                    reason: format!("Invalid extension-field multiproof: {err:?}"),
+                })?;
+
+                if computed_root != expected_root {
+                    return Err(VerifierError::MerkleProofInvalid {
+                        position: 0,
+                        reason: "Extension field Merkle multiproof root mismatch".to_string(),
+                    });
+                }
+
+                Ok(values.clone())
+            }
         }
-
-        Ok(results)
     }
 }
 

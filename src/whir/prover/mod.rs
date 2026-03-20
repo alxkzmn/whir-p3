@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{format, vec::Vec};
 use core::ops::Deref;
 
 use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
@@ -24,8 +24,9 @@ use crate::{
             Constraint,
             statement::{SelectStatement, initial::InitialStatement},
         },
+        merkle_multiproof::build_multiproof_from_paths,
         parameters::SumcheckStrategy,
-        proof::{QueryOpening, SumcheckData, WhirProof},
+        proof::{QueryBatchOpening, SumcheckData, WhirProof},
         utils::get_challenge_stir_queries,
     },
 };
@@ -288,34 +289,27 @@ where
             challenger,
         )?;
 
-        let stir_vars = stir_challenges_indexes
+        let stir_vars: Vec<_> = stir_challenges_indexes
             .iter()
             .map(|&i| round_params.folded_domain_gen.exp_u64(i as u64))
-            .collect::<Vec<_>>();
+            .collect();
 
         let mut stir_statement = SelectStatement::initialize(num_variables);
-
-        // Initialize vector of queries
-        let mut queries = Vec::with_capacity(stir_challenges_indexes.len());
 
         // Collect Merkle proofs for stir queries
         match &round_state.merkle_prover_data {
             None => {
-                let mut answers = Vec::with_capacity(stir_challenges_indexes.len());
+                let mut answers: Vec<Vec<F>> = Vec::with_capacity(stir_challenges_indexes.len());
+                let mut opening_paths = Vec::with_capacity(stir_challenges_indexes.len());
                 for challenge in &stir_challenges_indexes {
                     let commitment =
                         mmcs.open_batch(*challenge, &round_state.commitment_merkle_prover_data);
-                    let answer = commitment.opened_values[0].clone();
-                    answers.push(answer.clone());
-
-                    queries.push(QueryOpening::Base {
-                        values: answer.clone(),
-                        proof: commitment.opening_proof,
-                    });
+                    answers.push(commitment.opened_values[0].clone());
+                    opening_paths.push(commitment.opening_proof);
                 }
 
                 // Process each set of evaluations retrieved from the Merkle tree openings.
-                for (answer, var) in answers.iter().zip(stir_vars.into_iter()) {
+                for (answer, var) in answers.iter().zip(stir_vars.iter().copied()) {
                     let evals = EvaluationsList::new(answer.clone());
                     // Fold the polynomial represented by the `answer` evaluations using the verifier's challenge.
                     // The evaluation method depends on whether this is a "skip round" or a "standard round".
@@ -328,32 +322,48 @@ where
                     let eval = evals.evaluate_hypercube_base(&round_state.folding_randomness);
                     stir_statement.add_constraint(var, eval);
                 }
+
+                let multiproof =
+                    build_multiproof_from_paths(&stir_challenges_indexes, opening_paths).map_err(
+                        |err| FiatShamirError::InvalidMerkleMultiproof {
+                            details: format!("base round {round_index}: {err:?}"),
+                        },
+                    )?;
+                proof.rounds[round_index].query_batch = Some(QueryBatchOpening::Base {
+                    values: answers,
+                    proof: multiproof,
+                });
             }
             Some(data) => {
-                let mut answers = Vec::with_capacity(stir_challenges_indexes.len());
+                let mut answers: Vec<Vec<EF>> = Vec::with_capacity(stir_challenges_indexes.len());
+                let mut opening_paths = Vec::with_capacity(stir_challenges_indexes.len());
                 for challenge in &stir_challenges_indexes {
                     let commitment = extension_mmcs.open_batch(*challenge, data);
-                    let answer = commitment.opened_values[0].clone();
-                    answers.push(answer.clone());
-                    queries.push(QueryOpening::Extension {
-                        values: answer.clone(),
-                        proof: commitment.opening_proof,
-                    });
+                    answers.push(commitment.opened_values[0].clone());
+                    opening_paths.push(commitment.opening_proof);
                 }
 
                 // Process each set of evaluations retrieved from the Merkle tree openings.
-                for (answer, var) in answers.iter().zip(stir_vars.into_iter()) {
+                for (answer, var) in answers.iter().zip(stir_vars.iter().copied()) {
                     // Wrap the evaluations to represent the polynomial.
                     let evals = EvaluationsList::new(answer.clone());
                     // Perform a standard multilinear evaluation at the full challenge point `r`.
                     let eval = evals.evaluate_hypercube_ext::<F>(&round_state.folding_randomness);
                     stir_statement.add_constraint(var, eval);
                 }
+
+                let multiproof =
+                    build_multiproof_from_paths(&stir_challenges_indexes, opening_paths).map_err(
+                        |err| FiatShamirError::InvalidMerkleMultiproof {
+                            details: format!("extension round {round_index}: {err:?}"),
+                        },
+                    )?;
+                proof.rounds[round_index].query_batch = Some(QueryBatchOpening::Extension {
+                    values: answers,
+                    proof: multiproof,
+                });
             }
         }
-
-        // Store queries in proof
-        proof.rounds[round_index].queries = queries;
 
         let constraint = Constraint::new(
             challenger.sample_algebra_element(),
@@ -441,25 +451,44 @@ where
 
         match &round_state.merkle_prover_data {
             None => {
-                for challenge in final_challenge_indexes {
+                let mut values = Vec::with_capacity(final_challenge_indexes.len());
+                let mut opening_paths = Vec::with_capacity(final_challenge_indexes.len());
+                for &challenge in &final_challenge_indexes {
                     let commitment =
                         mmcs.open_batch(challenge, &round_state.commitment_merkle_prover_data);
-
-                    proof.final_queries.push(QueryOpening::Base {
-                        values: commitment.opened_values[0].clone(),
-                        proof: commitment.opening_proof,
-                    });
+                    values.push(commitment.opened_values[0].clone());
+                    opening_paths.push(commitment.opening_proof);
                 }
+                let multiproof =
+                    build_multiproof_from_paths(&final_challenge_indexes, opening_paths).map_err(
+                        |err| FiatShamirError::InvalidMerkleMultiproof {
+                            details: format!("final base round {round_index}: {err:?}"),
+                        },
+                    )?;
+                proof.final_query_batch = Some(QueryBatchOpening::Base {
+                    values,
+                    proof: multiproof,
+                });
             }
 
             Some(data) => {
-                for challenge in final_challenge_indexes {
+                let mut values = Vec::with_capacity(final_challenge_indexes.len());
+                let mut opening_paths = Vec::with_capacity(final_challenge_indexes.len());
+                for &challenge in &final_challenge_indexes {
                     let commitment = extension_mmcs.open_batch(challenge, data);
-                    proof.final_queries.push(QueryOpening::Extension {
-                        values: commitment.opened_values[0].clone(),
-                        proof: commitment.opening_proof,
-                    });
+                    values.push(commitment.opened_values[0].clone());
+                    opening_paths.push(commitment.opening_proof);
                 }
+                let multiproof =
+                    build_multiproof_from_paths(&final_challenge_indexes, opening_paths).map_err(
+                        |err| FiatShamirError::InvalidMerkleMultiproof {
+                            details: format!("final extension round {round_index}: {err:?}"),
+                        },
+                    )?;
+                proof.final_query_batch = Some(QueryBatchOpening::Extension {
+                    values,
+                    proof: multiproof,
+                });
             }
         }
 
