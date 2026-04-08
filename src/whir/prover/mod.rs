@@ -24,7 +24,7 @@ use crate::{
             Constraint,
             statement::{SelectStatement, initial::InitialStatement},
         },
-        merkle_multiproof::build_multiproof_from_paths,
+        merkle_multiproof::build_linearized_multiproof_from_paths,
         parameters::SumcheckStrategy,
         proof::{QueryBatchOpening, SumcheckData, WhirProof},
         utils::get_challenge_stir_queries,
@@ -327,11 +327,10 @@ where
                 }
 
                 let multiproof =
-                    build_multiproof_from_paths(&stir_challenges_indexes, opening_paths).map_err(
-                        |err| FiatShamirError::InvalidMerkleMultiproof {
+                    build_linearized_multiproof_from_paths(&stir_challenges_indexes, opening_paths)
+                        .map_err(|err| FiatShamirError::InvalidMerkleMultiproof {
                             details: format!("base round {round_index}: {err:?}"),
-                        },
-                    )?;
+                        })?;
                 proof.rounds[round_index].query_batch = Some(QueryBatchOpening::Base {
                     values: answers,
                     proof: multiproof,
@@ -359,11 +358,10 @@ where
                 }
 
                 let multiproof =
-                    build_multiproof_from_paths(&stir_challenges_indexes, opening_paths).map_err(
-                        |err| FiatShamirError::InvalidMerkleMultiproof {
+                    build_linearized_multiproof_from_paths(&stir_challenges_indexes, opening_paths)
+                        .map_err(|err| FiatShamirError::InvalidMerkleMultiproof {
                             details: format!("extension round {round_index}: {err:?}"),
-                        },
-                    )?;
+                        })?;
                 proof.rounds[round_index].query_batch = Some(QueryBatchOpening::Extension {
                     values: answers,
                     proof: multiproof,
@@ -469,11 +467,10 @@ where
                     opening_paths.push(commitment.opening_proof);
                 }
                 let multiproof =
-                    build_multiproof_from_paths(&final_challenge_indexes, opening_paths).map_err(
-                        |err| FiatShamirError::InvalidMerkleMultiproof {
+                    build_linearized_multiproof_from_paths(&final_challenge_indexes, opening_paths)
+                        .map_err(|err| FiatShamirError::InvalidMerkleMultiproof {
                             details: format!("final base round {round_index}: {err:?}"),
-                        },
-                    )?;
+                        })?;
                 proof.final_query_batch = Some(QueryBatchOpening::Base {
                     values,
                     proof: multiproof,
@@ -492,11 +489,10 @@ where
                     opening_paths.push(commitment.opening_proof);
                 }
                 let multiproof =
-                    build_multiproof_from_paths(&final_challenge_indexes, opening_paths).map_err(
-                        |err| FiatShamirError::InvalidMerkleMultiproof {
+                    build_linearized_multiproof_from_paths(&final_challenge_indexes, opening_paths)
+                        .map_err(|err| FiatShamirError::InvalidMerkleMultiproof {
                             details: format!("final extension round {round_index}: {err:?}"),
-                        },
-                    )?;
+                        })?;
                 proof.final_query_batch = Some(QueryBatchOpening::Extension {
                     values,
                     proof: multiproof,

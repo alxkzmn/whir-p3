@@ -120,7 +120,7 @@ pub enum QueryBatchOpening<F, EF, W, const DIGEST_ELEMS: usize> {
     Base {
         /// Merkle leaf values in F for each queried index.
         values: Vec<Vec<F>>,
-        /// Deduplicated Merkle multiproof for all queried indices.
+        /// Query-major concatenation of per-query Merkle sibling paths.
         proof: MerkleMultiProof<W, DIGEST_ELEMS>,
     },
     /// Extension field query (round_index > 0)
@@ -128,7 +128,7 @@ pub enum QueryBatchOpening<F, EF, W, const DIGEST_ELEMS: usize> {
     Extension {
         /// Merkle leaf values in EF for each queried index.
         values: Vec<Vec<EF>>,
-        /// Deduplicated Merkle multiproof for all queried indices.
+        /// Query-major concatenation of per-query Merkle sibling paths.
         proof: MerkleMultiProof<W, DIGEST_ELEMS>,
     },
 }

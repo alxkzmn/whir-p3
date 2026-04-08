@@ -47,14 +47,15 @@ mod enabled {
     use super::HashCountSnapshot;
 
     #[inline]
-    pub fn add_leaf_hash_call() {}
+    pub const fn add_leaf_hash_call() {}
 
     #[inline]
-    pub fn add_node_hash_call() {}
+    pub const fn add_node_hash_call() {}
 
     #[inline]
-    pub fn reset_hash_counters() {}
+    pub const fn reset_hash_counters() {}
 
+    #[must_use]
     #[inline]
     pub fn snapshot_hash_counters() -> HashCountSnapshot {
         HashCountSnapshot::default()

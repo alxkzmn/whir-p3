@@ -22,7 +22,9 @@ use crate::{
             evaluator::ConstraintPolyEvaluator,
             statement::{EqStatement, SelectStatement},
         },
-        merkle_multiproof::{compute_root_from_multiproof, hash_leaf_base, hash_leaf_extension},
+        merkle_multiproof::{
+            compute_root_from_linearized_multiproof, hash_leaf_base, hash_leaf_extension,
+        },
         parameters::WhirConfig,
         proof::{QueryBatchOpening, WhirProof},
         verifier::sumcheck::{verify_final_sumcheck_rounds, verify_sumcheck_rounds},
@@ -426,7 +428,7 @@ where
                     .map(|row| hash_leaf_base::<F, W, H, DIGEST_ELEMS>(&self.merkle_hash, row))
                     .collect();
 
-                let computed_root = compute_root_from_multiproof(
+                let computed_root = compute_root_from_linearized_multiproof(
                     indices,
                     &leaf_hashes,
                     depth,
@@ -472,7 +474,7 @@ where
                     })
                     .collect();
 
-                let computed_root = compute_root_from_multiproof(
+                let computed_root = compute_root_from_linearized_multiproof(
                     indices,
                     &leaf_hashes,
                     depth,

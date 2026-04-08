@@ -51,6 +51,9 @@ pub enum MultiproofError {
         layer_size: usize,
         index: usize,
     },
+    RootMismatch {
+        query: usize,
+    },
 }
 
 fn ensure_sorted_unique(indices: &[usize]) -> Result<(), MultiproofError> {
@@ -142,6 +145,33 @@ pub fn build_multiproof_from_paths<W: Clone + Eq, const DIGEST_ELEMS: usize>(
     Ok(MerkleMultiProof { decommitments })
 }
 
+pub fn build_linearized_multiproof_from_paths<W: Clone, const DIGEST_ELEMS: usize>(
+    indices: &[usize],
+    opening_paths: Vec<Vec<[W; DIGEST_ELEMS]>>,
+) -> Result<MerkleMultiProof<W, DIGEST_ELEMS>, MultiproofError> {
+    ensure_sorted_unique(indices)?;
+    if indices.len() != opening_paths.len() {
+        return Err(MultiproofError::LengthMismatch {
+            indices: indices.len(),
+            openings: opening_paths.len(),
+        });
+    }
+
+    let depth = opening_paths.first().map_or(0, Vec::len);
+    for path in &opening_paths {
+        if path.len() != depth {
+            return Err(MultiproofError::InconsistentPathLength {
+                expected: depth,
+                got: path.len(),
+            });
+        }
+    }
+
+    Ok(MerkleMultiProof {
+        decommitments: opening_paths.into_iter().flatten().collect(),
+    })
+}
+
 pub fn compute_root_from_multiproof<W: Copy + Eq, C, const DIGEST_ELEMS: usize>(
     indices: &[usize],
     leaf_hashes: &[[W; DIGEST_ELEMS]],
@@ -193,11 +223,10 @@ where
                 decommitment_cursor += 1;
                 cursor += 1;
 
+                add_node_hash_call();
                 if node & 1 == 0 {
-                    add_node_hash_call();
                     compress([hash, sibling_hash])
                 } else {
-                    add_node_hash_call();
                     compress([sibling_hash, hash])
                 }
             };
@@ -224,6 +253,67 @@ where
     }
 
     Ok(frontier[0].1)
+}
+
+pub fn compute_root_from_linearized_multiproof<W: Copy + Eq, C, const DIGEST_ELEMS: usize>(
+    indices: &[usize],
+    leaf_hashes: &[[W; DIGEST_ELEMS]],
+    depth: usize,
+    decommitments: &[[W; DIGEST_ELEMS]],
+    mut compress: C,
+) -> Result<[W; DIGEST_ELEMS], MultiproofError>
+where
+    C: FnMut([[W; DIGEST_ELEMS]; 2]) -> [W; DIGEST_ELEMS],
+{
+    ensure_sorted_unique(indices)?;
+    if indices.len() != leaf_hashes.len() {
+        return Err(MultiproofError::LengthMismatch {
+            indices: indices.len(),
+            openings: leaf_hashes.len(),
+        });
+    }
+
+    let expected_decommitments = indices.len().saturating_mul(depth);
+    if decommitments.len() < expected_decommitments {
+        return Err(MultiproofError::InsufficientDecommitments {
+            expected_at_least: expected_decommitments,
+            got: decommitments.len(),
+        });
+    }
+    if decommitments.len() > expected_decommitments {
+        return Err(MultiproofError::TrailingDecommitments {
+            consumed: expected_decommitments,
+            total: decommitments.len(),
+        });
+    }
+
+    let mut reconstructed_root = None;
+    for (query, (&index, &leaf_hash)) in indices.iter().zip(leaf_hashes.iter()).enumerate() {
+        let mut node = index;
+        let mut digest = leaf_hash;
+        let path_start = query * depth;
+        let path_end = path_start + depth;
+
+        for &sibling in &decommitments[path_start..path_end] {
+            add_node_hash_call();
+            digest = if node & 1 == 0 {
+                compress([digest, sibling])
+            } else {
+                compress([sibling, digest])
+            };
+            node >>= 1;
+        }
+
+        if let Some(expected_root) = reconstructed_root {
+            if digest != expected_root {
+                return Err(MultiproofError::RootMismatch { query });
+            }
+        } else {
+            reconstructed_root = Some(digest);
+        }
+    }
+
+    reconstructed_root.ok_or(MultiproofError::EmptyIndices)
 }
 
 /// Compute a base-field leaf hash in the same format used by WHIR commitments.
@@ -272,7 +362,8 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::SmallRng, seq::SliceRandom};
 
     use super::{
-        MultiproofError, build_multiproof_from_paths, compute_root_from_multiproof, hash_leaf_base,
+        MultiproofError, build_linearized_multiproof_from_paths, build_multiproof_from_paths,
+        compute_root_from_linearized_multiproof, compute_root_from_multiproof, hash_leaf_base,
         hash_leaf_extension,
     };
 
@@ -520,5 +611,313 @@ mod tests {
                 .flat_map(|el: &EF| el.as_basis_coefficients_slice().iter().copied()),
         );
         assert_eq!(helper, manual);
+    }
+
+    // --- Linearized multiproof tests ---
+
+    #[test]
+    fn linearized_single_query_roundtrip() {
+        let height = 16;
+        let width = 4;
+        let (mmcs, hash, compress) = make_mmcs(201);
+        let matrix = random_matrix(202, height, width);
+        let (commit, prover_data) = mmcs.commit_matrix(matrix.clone());
+
+        let index = 5usize;
+        let opening = mmcs.open_batch(index, &prover_data);
+        let opened_row = opening.opened_values[0].clone();
+        let path = opening.opening_proof.clone();
+        let depth = path.len();
+
+        let multiproof =
+            build_linearized_multiproof_from_paths(&[index], vec![path.clone()]).unwrap();
+        // Single query: linearized decommitments == raw path
+        assert_eq!(multiproof.decommitments, path);
+
+        let root = compute_root_from_linearized_multiproof(
+            &[index],
+            &leaf_hashes(&hash, &[opened_row]),
+            depth,
+            &multiproof.decommitments,
+            |pair| compress.compress(pair),
+        )
+        .unwrap();
+        let expected_root: [F; 8] = commit.into();
+        assert_eq!(root, expected_root);
+    }
+
+    #[test]
+    fn linearized_multiple_queries_roundtrip() {
+        let height = 32;
+        let width = 4;
+        let (mmcs, hash, compress) = make_mmcs(211);
+        let matrix = random_matrix(212, height, width);
+        let (commit, prover_data) = mmcs.commit_matrix(matrix.clone());
+
+        let indices = [1usize, 7, 14, 25];
+        let mut opened_rows = Vec::new();
+        let mut paths = Vec::new();
+        for &index in &indices {
+            let opening = mmcs.open_batch(index, &prover_data);
+            opened_rows.push(opening.opened_values[0].clone());
+            paths.push(opening.opening_proof);
+        }
+        let depth = paths[0].len();
+
+        let multiproof = build_linearized_multiproof_from_paths(&indices, paths).unwrap();
+        // Linearized: nq * depth decommitments (no dedup)
+        assert_eq!(multiproof.decommitments.len(), indices.len() * depth);
+
+        let root = compute_root_from_linearized_multiproof(
+            &indices,
+            &leaf_hashes(&hash, &opened_rows),
+            depth,
+            &multiproof.decommitments,
+            |pair| compress.compress(pair),
+        )
+        .unwrap();
+        let expected_root: [F; 8] = commit.into();
+        assert_eq!(root, expected_root);
+    }
+
+    #[test]
+    fn linearized_adjacent_queries_no_dedup() {
+        let height = 16;
+        let width = 4;
+        let (mmcs, _hash, _compress) = make_mmcs(221);
+        let matrix = random_matrix(222, height, width);
+        let (_commit, prover_data) = mmcs.commit_matrix(matrix.clone());
+
+        let indices = [4usize, 5usize];
+        let mut paths = Vec::new();
+        let mut total_single = 0usize;
+        for &index in &indices {
+            let opening = mmcs.open_batch(index, &prover_data);
+            total_single += opening.opening_proof.len();
+            paths.push(opening.opening_proof);
+        }
+
+        let multiproof = build_linearized_multiproof_from_paths(&indices, paths).unwrap();
+        // Linearized keeps all sibling hashes — no dedup unlike frontier
+        assert_eq!(multiproof.decommitments.len(), total_single);
+    }
+
+    #[test]
+    fn linearized_tampered_decommitment_fails() {
+        let height = 16;
+        let width = 4;
+        let (mmcs, hash, compress) = make_mmcs(231);
+        let matrix = random_matrix(232, height, width);
+        let (commit, prover_data) = mmcs.commit_matrix(matrix.clone());
+
+        let indices = [2usize, 9usize];
+        let mut opened_rows = Vec::new();
+        let mut paths = Vec::new();
+        for &index in &indices {
+            let opening = mmcs.open_batch(index, &prover_data);
+            opened_rows.push(opening.opened_values[0].clone());
+            paths.push(opening.opening_proof);
+        }
+        let depth = paths[0].len();
+
+        let mut multiproof = build_linearized_multiproof_from_paths(&indices, paths).unwrap();
+        // Tamper with first query's first sibling
+        multiproof.decommitments[0][0] += F::ONE;
+
+        let result = compute_root_from_linearized_multiproof(
+            &indices,
+            &leaf_hashes(&hash, &opened_rows),
+            depth,
+            &multiproof.decommitments,
+            |pair| compress.compress(pair),
+        );
+        let expected_root: [F; 8] = commit.into();
+        // Tampering the first query makes it compute a wrong root.
+        // The second query then either produces a RootMismatch error
+        // (cross-check against first query's wrong root), or if there's
+        // only one query, we get the wrong root back silently.
+        match result {
+            Err(MultiproofError::RootMismatch { .. }) => {} // detected via cross-check
+            Ok(root) => assert_ne!(root, expected_root),    // wrong root returned
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn linearized_tampered_second_query_returns_root_mismatch() {
+        let height = 16;
+        let width = 4;
+        let (mmcs, hash, compress) = make_mmcs(241);
+        let matrix = random_matrix(242, height, width);
+        let (_commit, prover_data) = mmcs.commit_matrix(matrix.clone());
+
+        let indices = [3usize, 11usize];
+        let mut opened_rows = Vec::new();
+        let mut paths = Vec::new();
+        for &index in &indices {
+            let opening = mmcs.open_batch(index, &prover_data);
+            opened_rows.push(opening.opened_values[0].clone());
+            paths.push(opening.opening_proof);
+        }
+        let depth = paths[0].len();
+
+        let mut multiproof = build_linearized_multiproof_from_paths(&indices, paths).unwrap();
+        // Tamper with second query's first sibling (offset = depth)
+        multiproof.decommitments[depth][0] += F::ONE;
+
+        let err = compute_root_from_linearized_multiproof(
+            &indices,
+            &leaf_hashes(&hash, &opened_rows),
+            depth,
+            &multiproof.decommitments,
+            |pair| compress.compress(pair),
+        )
+        .unwrap_err();
+        assert!(matches!(err, MultiproofError::RootMismatch { query: 1 }));
+    }
+
+    #[test]
+    fn linearized_trailing_decommitments_rejected() {
+        let height = 16;
+        let width = 4;
+        let (mmcs, hash, compress) = make_mmcs(251);
+        let matrix = random_matrix(252, height, width);
+        let (_commit, prover_data) = mmcs.commit_matrix(matrix.clone());
+
+        let indices = [1usize, 6usize];
+        let mut opened_rows = Vec::new();
+        let mut paths = Vec::new();
+        for &index in &indices {
+            let opening = mmcs.open_batch(index, &prover_data);
+            opened_rows.push(opening.opened_values[0].clone());
+            paths.push(opening.opening_proof);
+        }
+        let depth = paths[0].len();
+
+        let mut multiproof = build_linearized_multiproof_from_paths(&indices, paths).unwrap();
+        multiproof.decommitments.push([F::ZERO; 8]);
+
+        let err = compute_root_from_linearized_multiproof(
+            &indices,
+            &leaf_hashes(&hash, &opened_rows),
+            depth,
+            &multiproof.decommitments,
+            |pair| compress.compress(pair),
+        )
+        .unwrap_err();
+        assert!(matches!(err, MultiproofError::TrailingDecommitments { .. }));
+    }
+
+    #[test]
+    fn linearized_insufficient_decommitments_rejected() {
+        let (_mmcs, _hash, compress) = make_mmcs(261);
+        let indices = [0usize, 1usize];
+        let lh = vec![[F::ZERO; 8]; 2];
+
+        let err = compute_root_from_linearized_multiproof(
+            &indices,
+            &lh,
+            4,                  // depth=4 → expects 2*4=8 decommitments
+            &[[F::ZERO; 8]; 3], // only 3
+            |pair| compress.compress(pair),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MultiproofError::InsufficientDecommitments { .. }
+        ));
+    }
+
+    #[test]
+    fn linearized_mismatched_lengths_rejected() {
+        let (_mmcs, _hash, compress) = make_mmcs(271);
+        let indices = [0usize, 1usize];
+        let lh = vec![[F::ZERO; 8]]; // 1 leaf hash, 2 indices
+
+        let err =
+            compute_root_from_linearized_multiproof(&indices, &lh, 1, &[[F::ZERO; 8]; 2], |pair| {
+                compress.compress(pair)
+            })
+            .unwrap_err();
+        assert!(matches!(err, MultiproofError::LengthMismatch { .. }));
+    }
+
+    #[test]
+    fn linearized_inconsistent_path_lengths_rejected() {
+        let indices = [0usize, 1usize];
+        let paths = vec![
+            vec![[F::ZERO; 8]; 4], // depth 4
+            vec![[F::ZERO; 8]; 3], // depth 3 — mismatch
+        ];
+        let err = build_linearized_multiproof_from_paths::<F, 8>(&indices, paths).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiproofError::InconsistentPathLength { .. }
+        ));
+    }
+
+    #[test]
+    fn linearized_empty_indices_returns_error() {
+        let (_mmcs, _hash, compress) = make_mmcs(281);
+        let err = compute_root_from_linearized_multiproof::<F, _, 8>(&[], &[], 4, &[], |pair| {
+            compress.compress(pair)
+        })
+        .unwrap_err();
+        assert!(matches!(err, MultiproofError::EmptyIndices));
+    }
+
+    #[test]
+    fn linearized_randomized_cross_check() {
+        let mut rng = SmallRng::seed_from_u64(291);
+        for round in 0..20 {
+            let log_height = rng.random_range(3..=7);
+            let height = 1usize << log_height;
+            let width = rng.random_range(1..=6);
+            let (mmcs, hash, compress) = make_mmcs(3_000 + round);
+            let matrix = random_matrix(4_000 + round, height, width);
+            let (commit, prover_data) = mmcs.commit_matrix(matrix.clone());
+
+            let sample_size = rng.random_range(1..=height);
+            let mut indices: Vec<_> = (0..height).collect();
+            indices.shuffle(&mut rng);
+            indices.truncate(sample_size);
+            indices.sort_unstable();
+            indices.dedup();
+
+            let mut opened_rows = Vec::new();
+            let mut paths = Vec::new();
+            for &index in &indices {
+                let opening = mmcs.open_batch(index, &prover_data);
+                mmcs.verify_batch(
+                    &commit,
+                    &[Dimensions { height, width }],
+                    index,
+                    (&opening).into(),
+                )
+                .unwrap();
+                opened_rows.push(opening.opened_values[0].clone());
+                paths.push(opening.opening_proof);
+            }
+
+            let depth = paths[0].len();
+            let multiproof = build_linearized_multiproof_from_paths(&indices, paths).unwrap();
+            assert_eq!(multiproof.decommitments.len(), indices.len() * depth);
+
+            let root = compute_root_from_linearized_multiproof(
+                &indices,
+                &leaf_hashes(&hash, &opened_rows),
+                depth,
+                &multiproof.decommitments,
+                |pair| compress.compress(pair),
+            )
+            .unwrap();
+            let expected_root: [F; 8] = commit.into();
+            assert_eq!(
+                root,
+                expected_root,
+                "round {round}: height={height} width={width} nq={}",
+                indices.len()
+            );
+        }
     }
 }
