@@ -23,7 +23,7 @@ use crate::{
 /// This structure encapsulates the complete state needed for each round of the WHIR
 /// interactive proof system.
 #[derive(Debug)]
-pub struct RoundState<EF, F, W, M, const DIGEST_ELEMS: usize>
+pub struct RoundState<'a, EF, F, W, M, const DIGEST_ELEMS: usize>
 where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField,
@@ -61,7 +61,7 @@ where
     /// In WHIR's proximity testing, this commitment proves the prover knows some
     /// polynomial that is purportedly close to a Reed-Solomon codeword. The verifier
     /// can later query specific positions to verify proximity claims.
-    pub commitment_merkle_prover_data: MerkleTree<F, W, M, DIGEST_ELEMS>,
+    pub commitment_merkle_prover_data: &'a MerkleTree<F, W, M, DIGEST_ELEMS>,
 
     /// Merkle tree commitment for extension field polynomials f': (EF)^{n-k} → EF.
     ///
@@ -75,7 +75,7 @@ where
 }
 
 #[allow(clippy::mismatching_type_param_order)]
-impl<EF, F, W, const DIGEST_ELEMS: usize> RoundState<EF, F, W, DenseMatrix<F>, DIGEST_ELEMS>
+impl<'a, EF, F, W, const DIGEST_ELEMS: usize> RoundState<'a, EF, F, W, DenseMatrix<F>, DIGEST_ELEMS>
 where
     F: TwoAdicField + Ord,
     EF: ExtensionField<F> + TwoAdicField,
@@ -98,7 +98,7 @@ where
         sumcheck_data: &mut SumcheckData<F, EF>,
         challenger: &mut Challenger,
         statement: &InitialStatement<F, EF>,
-        prover_data: MerkleTree<F, W, DenseMatrix<F>, DIGEST_ELEMS>,
+        prover_data: &'a MerkleTree<F, W, DenseMatrix<F>, DIGEST_ELEMS>,
         folding_factor: usize,
         pow_bits: usize,
     ) -> Result<Self, FiatShamirError>

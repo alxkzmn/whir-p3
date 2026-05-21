@@ -168,7 +168,7 @@ fn test_no_initial_statement_no_sumcheck() {
         &mut proof.initial_sumcheck,
         &mut challenger,
         &statement,
-        prover_data,
+        &prover_data,
         config.folding_factor.at_round(0),
         0,
     )
@@ -243,7 +243,7 @@ fn test_initial_statement_with_folding_factor_3() {
         &mut proof.initial_sumcheck,
         &mut challenger_rf,
         &statement,
-        prover_data,
+        &prover_data,
         config.folding_factor.at_round(0),
         0,
     )
@@ -316,7 +316,7 @@ fn test_zero_poly_multiple_constraints() {
         &mut proof.initial_sumcheck,
         &mut challenger_rf,
         &statement,
-        prover_data,
+        &prover_data,
         folding0,
         0,
     )
@@ -411,7 +411,7 @@ fn test_initialize_round_state_with_initial_statement() {
         &mut proof.initial_sumcheck,
         &mut challenger_rf,
         &statement,
-        prover_data,
+        &prover_data,
         folding0,
         pow_bits,
     )

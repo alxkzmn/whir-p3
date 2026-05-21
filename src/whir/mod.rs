@@ -137,7 +137,7 @@ mod test {
                 &mut proof,
                 &mut prover_challenger,
                 &statement,
-                prover_data,
+                &prover_data,
             )
             .unwrap();
 
@@ -347,7 +347,7 @@ mod test {
                     &mut proof,
                     &mut prover_challenger,
                     &statement,
-                    prover_data,
+                    &prover_data,
                 )
                 .unwrap();
 

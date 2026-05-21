@@ -126,7 +126,7 @@ where
         proof: &mut WhirProof<F, EF, W, DIGEST_ELEMS>,
         challenger: &mut Challenger,
         statement: &InitialStatement<F, EF>,
-        prover_data: MerkleTree<F, W, DenseMatrix<F>, DIGEST_ELEMS>,
+        prover_data: &MerkleTree<F, W, DenseMatrix<F>, DIGEST_ELEMS>,
     ) -> Result<(), FiatShamirError>
     where
         Dft: TwoAdicSubgroupDft<F>,
@@ -177,7 +177,7 @@ where
         round_index: usize,
         proof: &mut WhirProof<F, EF, W, DIGEST_ELEMS>,
         challenger: &mut Challenger,
-        round_state: &mut RoundState<EF, F, W, DenseMatrix<F>, DIGEST_ELEMS>,
+        round_state: &mut RoundState<'_, EF, F, W, DenseMatrix<F>, DIGEST_ELEMS>,
     ) -> Result<(), FiatShamirError>
     where
         P: PackedValue<Value = F> + Eq + Send + Sync,
@@ -306,7 +306,7 @@ where
                 // prover CPU/RAM overhead without changing proof semantics.
                 for challenge in &stir_challenges_indexes {
                     let commitment =
-                        mmcs.open_batch(*challenge, &round_state.commitment_merkle_prover_data);
+                        mmcs.open_batch(*challenge, round_state.commitment_merkle_prover_data);
                     answers.push(commitment.opened_values[0].clone());
                     opening_paths.push(commitment.opening_proof);
                 }
@@ -400,7 +400,7 @@ where
         round_index: usize,
         proof: &mut WhirProof<F, EF, W, DIGEST_ELEMS>,
         challenger: &mut Challenger,
-        round_state: &mut RoundState<EF, F, W, DenseMatrix<F>, DIGEST_ELEMS>,
+        round_state: &mut RoundState<'_, EF, F, W, DenseMatrix<F>, DIGEST_ELEMS>,
     ) -> Result<(), FiatShamirError>
     where
         P: PackedValue<Value = F> + Eq + Send + Sync,
@@ -464,7 +464,7 @@ where
                 // prover CPU/RAM overhead without changing proof semantics.
                 for &challenge in &final_challenge_indexes {
                     let commitment =
-                        mmcs.open_batch(challenge, &round_state.commitment_merkle_prover_data);
+                        mmcs.open_batch(challenge, round_state.commitment_merkle_prover_data);
                     values.push(commitment.opened_values[0].clone());
                     opening_paths.push(commitment.opening_proof);
                 }
