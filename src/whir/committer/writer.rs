@@ -61,7 +61,7 @@ where
         proof: &mut WhirProof<F, EF, W, DIGEST_ELEMS>,
         challenger: &mut Challenger,
         statement: &mut InitialStatement<F, EF>,
-    ) -> Result<MerkleTree<F, W, DenseMatrix<F>, DIGEST_ELEMS>, FiatShamirError>
+    ) -> Result<MerkleTree<F, W, DenseMatrix<F>, 2, DIGEST_ELEMS>, FiatShamirError>
     where
         Dft: TwoAdicSubgroupDft<F>,
         P: PackedValue<Value = F> + Eq + Send + Sync,
@@ -98,16 +98,18 @@ where
             .in_scope(|| dft.dft_batch(padded).to_row_major_matrix());
 
         // Commit to the Merkle tree (using P for leaves and PW for digest SIMD)
-        let merkle_tree = MerkleTreeMmcs::<P, PW, H, C, DIGEST_ELEMS>::new(
+        let merkle_tree = MerkleTreeMmcs::<P, PW, H, C, 2, DIGEST_ELEMS>::new(
             self.merkle_hash.clone(),
             self.merkle_compress.clone(),
+            0,
         );
         let (root, prover_data) =
             info_span!("commit_matrix").in_scope(|| merkle_tree.commit_matrix(folded_matrix));
 
-        proof.initial_commitment = *root.as_ref();
+        let root_digest = root.roots()[0];
+        proof.initial_commitment = root_digest;
         // Use CanObserve<Hash<F, W, N>> which both DuplexChallenger and SerializingChallenger implement
-        challenger.observe(root);
+        challenger.observe(Hash::from(root_digest));
 
         // TODO: consider moving ood sampling to whir::Prover::prove
         (0..self.0.commitment_ood_samples).for_each(|_| {

@@ -5,4 +5,4 @@ pub mod reader;
 pub mod writer;
 
 pub type ProverDataView<F, EF, W, const DIGEST_ELEMS: usize> =
-    MerkleTree<F, W, FlatMatrixView<F, EF, DenseMatrix<EF>>, DIGEST_ELEMS>;
+    MerkleTree<F, W, FlatMatrixView<F, EF, DenseMatrix<EF>>, 2, DIGEST_ELEMS>;

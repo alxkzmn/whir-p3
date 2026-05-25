@@ -86,7 +86,7 @@ fn setup_domain_and_commitment(
 ) -> (
     WhirProof<F, EF4, F, DIGEST_ELEMS>,
     MyChallenger,
-    MerkleTree<F, F, DenseMatrix<F>, DIGEST_ELEMS>,
+    MerkleTree<F, F, DenseMatrix<F>, 2, DIGEST_ELEMS>,
 ) {
     // Build ProtocolParameters from WhirConfig fields
     let protocol_params = ProtocolParameters {

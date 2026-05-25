@@ -1,8 +1,7 @@
 use alloc::{vec, vec::Vec};
 
 use p3_field::{ExtensionField, Field, TwoAdicField};
-use p3_interpolation::interpolate_subgroup;
-use p3_matrix::dense::RowMajorMatrix;
+use p3_matrix::{dense::RowMajorMatrix, interpolation::Interpolate};
 use p3_util::log2_strict_usize;
 
 use crate::{
@@ -35,7 +34,7 @@ where
         .expect("skip challenge must be present");
     let r_rest = MultilinearPoint::new(r_all.as_slice()[..num_remaining_vars].to_vec());
 
-    let folded_row = interpolate_subgroup(&mat, r_skip);
+    let folded_row = mat.interpolate_subgroup(r_skip);
     EvaluationsList::new(folded_row).evaluate_hypercube_base(&r_rest)
 }
 

@@ -281,14 +281,15 @@ mod tests {
     type Perm = Poseidon2BabyBear<16>;
     type Hash = PaddingFreeSponge<Perm, 16, 8, 8>;
     type Compress = TruncatedPermutation<Perm, 2, 8, 16>;
-    type MyMmcs = MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, Hash, Compress, 8>;
+    type MyMmcs =
+        MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, Hash, Compress, 2, 8>;
 
     fn make_mmcs(seed: u64) -> (MyMmcs, Hash, Compress) {
         let mut rng = SmallRng::seed_from_u64(seed);
         let perm = Perm::new_from_rng_128(&mut rng);
         let hash = Hash::new(perm.clone());
         let compress = Compress::new(perm);
-        let mmcs = MyMmcs::new(hash.clone(), compress.clone());
+        let mmcs = MyMmcs::new(hash.clone(), compress.clone(), 0);
         (mmcs, hash, compress)
     }
 
@@ -333,7 +334,7 @@ mod tests {
             |pair| compress.compress(pair),
         )
         .unwrap();
-        let expected_root: [F; 8] = commit.into();
+        let expected_root: [F; 8] = commit.roots()[0];
         assert_eq!(root, expected_root);
     }
 
@@ -408,7 +409,7 @@ mod tests {
             |pair| compress.compress(pair),
         )
         .unwrap();
-        let expected_root: [F; 8] = commit.into();
+        let expected_root: [F; 8] = commit.roots()[0];
         assert_ne!(root, expected_root);
     }
 
@@ -455,7 +456,7 @@ mod tests {
                 |pair| compress.compress(pair),
             )
             .unwrap();
-            let expected_root: [F; 8] = commit.into();
+            let expected_root: [F; 8] = commit.roots()[0];
             assert_eq!(root, expected_root);
         }
     }

@@ -126,7 +126,7 @@ where
         proof: &mut WhirProof<F, EF, W, DIGEST_ELEMS>,
         challenger: &mut Challenger,
         statement: &InitialStatement<F, EF>,
-        prover_data: &MerkleTree<F, W, DenseMatrix<F>, DIGEST_ELEMS>,
+        prover_data: &MerkleTree<F, W, DenseMatrix<F>, 2, DIGEST_ELEMS>,
     ) -> Result<(), FiatShamirError>
     where
         Dft: TwoAdicSubgroupDft<F>,
@@ -230,19 +230,21 @@ where
         let folded_matrix = info_span!("dft", height = padded.height(), width = padded.width())
             .in_scope(|| dft.dft_algebra_batch(padded).to_row_major_matrix());
 
-        let mmcs = MerkleTreeMmcs::<P, PW, H, C, DIGEST_ELEMS>::new(
+        let mmcs = MerkleTreeMmcs::<P, PW, H, C, 2, DIGEST_ELEMS>::new(
             self.merkle_hash.clone(),
             self.merkle_compress.clone(),
+            0,
         );
         let extension_mmcs = ExtensionMmcs::new(mmcs.clone());
         let (root, prover_data) =
             info_span!("commit matrix").in_scope(|| extension_mmcs.commit_matrix(folded_matrix));
 
+        let root_digest = root.roots()[0];
         // Observe the round merkle tree commitment
-        challenger.observe(root);
+        challenger.observe(Hash::from(root_digest));
 
         // Store commitment in proof
-        proof.rounds[round_index].commitment = root.into();
+        proof.rounds[round_index].commitment = root_digest;
 
         // Handle OOD (Out-Of-Domain) samples
         let mut ood_statement = EqStatement::initialize(num_variables);
@@ -449,9 +451,10 @@ where
         )?;
 
         // Every query requires opening these many in the previous Merkle tree
-        let mmcs = MerkleTreeMmcs::<P, PW, H, C, DIGEST_ELEMS>::new(
+        let mmcs = MerkleTreeMmcs::<P, PW, H, C, 2, DIGEST_ELEMS>::new(
             self.merkle_hash.clone(),
             self.merkle_compress.clone(),
+            0,
         );
         let extension_mmcs = ExtensionMmcs::new(mmcs.clone());
 

@@ -61,7 +61,7 @@ where
     /// In WHIR's proximity testing, this commitment proves the prover knows some
     /// polynomial that is purportedly close to a Reed-Solomon codeword. The verifier
     /// can later query specific positions to verify proximity claims.
-    pub commitment_merkle_prover_data: &'a MerkleTree<F, W, M, DIGEST_ELEMS>,
+    pub commitment_merkle_prover_data: &'a MerkleTree<F, W, M, 2, DIGEST_ELEMS>,
 
     /// Merkle tree commitment for extension field polynomials f': (EF)^{n-k} → EF.
     ///
@@ -98,7 +98,7 @@ where
         sumcheck_data: &mut SumcheckData<F, EF>,
         challenger: &mut Challenger,
         statement: &InitialStatement<F, EF>,
-        prover_data: &'a MerkleTree<F, W, DenseMatrix<F>, DIGEST_ELEMS>,
+        prover_data: &'a MerkleTree<F, W, DenseMatrix<F>, 2, DIGEST_ELEMS>,
         folding_factor: usize,
         pow_bits: usize,
     ) -> Result<Self, FiatShamirError>
